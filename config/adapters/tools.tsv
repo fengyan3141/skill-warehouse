@@ -1,0 +1,10 @@
+# id	display_zh	mode	global_dir	project_dir	cli_command	app_name	verification
+codex	ChatGPT (Codex)	native	~/.agents/skills	.agents/skills	codex	ChatGPT	在设置中确认共享 Skill 目录可见
+cursor	Cursor	native	~/.agents/skills	.agents/skills	cursor	Cursor	在 Agent 设置中确认共享 Skill 目录可见
+gemini-cli	Gemini CLI	native	~/.agents/skills	.agents/skills	gemini	Gemini CLI	运行 gemini 后确认共享 Skill 目录可见
+claude-code	Claude Code	link	~/.claude/skills	.claude/skills	claude	Claude Code	确认软链目标为 ~/.agents/skills
+kiro	Kiro	link	~/.kiro/skills	.kiro/skills	kiro	Kiro	确认软链目标为 ~/.agents/skills
+trae	TRAE	link	~/.trae/skills	.trae/skills	trae	Trae	确认软链目标为 ~/.agents/skills
+trae-cn	TraeCode CN	link	~/.trae-cn/skills	.trae-cn/skills		Trae CN	确认软链目标为 ~/.agents/skills
+codebuddy	CodeBuddy	link	~/.codebuddy/skills	.codebuddy/skills	codebuddy	CodeBuddy CN	确认软链目标为 ~/.agents/skills
+qoder	Qoder	link	~/.qoder/skills	.qoder/skills	qoder	Qoder	确认软链目标为 ~/.agents/skills

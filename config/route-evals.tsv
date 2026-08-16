@@ -1,0 +1,9 @@
+class	expected_id	query
+clear	commit-message-writer	帮我写个 commit message
+clear	commit-message-writer	这次改动的提交信息怎么写
+clear	commit-message-writer	帮我总结一下这次改动写成 git commit
+clear	code-review-checklist	帮我审查一下这段代码
+clear	code-review-checklist	看看这个 PR 有没有问题
+clear	code-review-checklist	这段改动能合并吗，帮我 review 一下
+none		今天天气怎么样
+none		帮我订个会议室

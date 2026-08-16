@@ -1,0 +1,2184 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+# Dev package layout has lib/ and config/ as siblings of this script; the
+# installed layout (Task 10) puts this script in bin/ with lib/ and config/
+# one level up as siblings of bin/. Detect which one we're in.
+if [ -d "$SCRIPT_DIR/lib" ] && [ -d "$SCRIPT_DIR/config" ]; then
+  PACKAGE_ROOT="$SCRIPT_DIR"
+else
+  PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+fi
+SKILL_LIBRARY_ROOT="${SKILL_LIBRARY_ROOT:-$HOME/.skill-library}"
+CATALOG_FILE="$SKILL_LIBRARY_ROOT/catalog.tsv"
+GLOBAL_SKILLS_DIR="${SKILLS_ACTIVE:-${SKILL_GLOBAL_DIR:-$HOME/.agents/skills}}"
+PROJECT_SKILLS_DIR="${SKILL_PROJECT_DIR:-$(pwd -P)/.agents/skills}"
+PROFILE_DIR="$PACKAGE_ROOT/config/profiles"
+SKILL_LIB="$PACKAGE_ROOT/lib/skill-lib.sh"
+APPLICATIONS_DIR="${SKILL_APPLICATIONS_DIR:-/Applications}"
+
+[ -f "$SKILL_LIB" ] || {
+  printf '共享函数不存在: %s\n' "$SKILL_LIB" >&2
+  exit 1
+}
+# shellcheck source=lib/skill-lib.sh
+. "$SKILL_LIB"
+
+require_catalog() {
+  if [ ! -f "$CATALOG_FILE" ]; then
+    printf '目录不存在: %s\n' "$CATALOG_FILE" >&2
+    return 1
+  fi
+}
+
+catalog_entry() {
+  local id="$1"
+  awk -F '\t' -v id="$id" 'NF == 8 && $1 == id { print $2 "\t" $3; exit }' "$CATALOG_FILE"
+}
+
+physical_skill_target() {
+  local relative_path="$1"
+  real_dir "$SKILL_LIBRARY_ROOT/$relative_path"
+}
+
+relative_link_target() {
+  local from_dir="$1" target_dir="$2"
+  awk -v from="$from_dir" -v target="$target_dir" '
+    BEGIN {
+      count_from = split(from, from_parts, "/")
+      count_target = split(target, target_parts, "/")
+      position = 1
+      while (position <= count_from && position <= count_target && from_parts[position] == target_parts[position]) position++
+      result = ""
+      for (part = position; part <= count_from; part++) result = result (result == "" ? ".." : "/..")
+      for (part = position; part <= count_target; part++) result = result (result == "" ? target_parts[part] : "/" target_parts[part])
+      print (result == "" ? "." : result)
+    }
+  '
+}
+
+safe_link_directory() {
+  local directory="$1" ancestor suffix="" component physical inspected
+  case "$directory" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+
+  inspected="$directory"
+  while :; do
+    [ ! -L "$inspected" ] || return 1
+    [ "$inspected" = "/" ] && break
+    inspected="$(dirname "$inspected")"
+  done
+
+  ancestor="$directory"
+  while [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ]; do
+    component="$(basename "$ancestor")"
+    suffix="/$component$suffix"
+    ancestor="$(dirname "$ancestor")"
+  done
+  [ ! -L "$ancestor" ] || return 1
+  physical="$(real_dir "$ancestor")" || return 1
+  printf '%s%s\n' "$physical" "$suffix"
+}
+
+managed_link_matches() {
+  local link="$1" expected="$2" standard_target="$3" current raw_target
+  [ -L "$link" ] || return 1
+  raw_target="$(managed_link_target "$link")" || return 1
+  [ "$raw_target" = "$standard_target" ] || return 1
+  current="$(cd "$link" 2>/dev/null && pwd -P)" || return 1
+  [ "$current" = "$expected" ]
+}
+
+link_conflict_status() {
+  local link="$1" expected="$2" standard_target="$3"
+  if [ -L "$link" ]; then
+    if managed_link_matches "$link" "$expected" "$standard_target"; then
+      printf 'managed\n'
+    else
+      printf '外部软链冲突\n'
+    fi
+  elif [ -e "$link" ]; then
+    printf '真实目录冲突\n'
+  else
+    printf 'missing\n'
+  fi
+}
+
+display_for_id() {
+  local id="$1" entry
+  entry="$(catalog_entry "$id")"
+  [ -n "$entry" ] || return 1
+  printf '%s\n' "${entry#*"$(printf '	')"}"
+}
+
+# 出口状态写进全局变量 APPLY_LINK_STATUS（managed / skipped），供调用方判断
+# 这次调用是否真的建立/确认了受管软链——不能靠调用方事后自己拿 [ -L ... ]
+# 去猜，猜会被"路径中间有祖先软链，凑巧落在别的软链上"这种情况骗过去。
+apply_link_for_id() {
+  local destination_dir="$1" id="$2" apply="$3" entry relative_path display target link status relative_target safe_destination
+  APPLY_LINK_STATUS="skipped"
+  valid_skill_name "$id" || {
+    printf '[跳过] 非法 Skill ID %s\n' "$id"
+    return 0
+  }
+  entry="$(catalog_entry "$id")"
+  [ -n "$entry" ] || {
+    printf '[跳过] 未登记 Skill %s\n' "$id"
+    return 0
+  }
+  relative_path="${entry%%"$(printf '	')"*}"
+  display="${entry#*"$(printf '	')"}"
+  target="$(physical_skill_target "$relative_path" 2>/dev/null || true)"
+  [ -n "$target" ] || {
+    printf '[跳过] 仓库缺少 %s\n' "$id"
+    return 0
+  }
+  safe_destination="$(safe_link_directory "$destination_dir" 2>/dev/null || true)"
+  [ -n "$safe_destination" ] || {
+    printf '[跳过] 目标路径含软链 %s\n' "$destination_dir"
+    return 0
+  }
+  link="$safe_destination/$id"
+  relative_target="$(relative_link_target "$safe_destination" "$target")"
+  status="$(link_conflict_status "$link" "$target" "$relative_target")"
+  case "$status" in
+    managed)
+      APPLY_LINK_STATUS="managed"
+      printf '[已激活] %s -> %s\n' "$display" "$link"
+      return 0
+      ;;
+    真实目录冲突|外部软链冲突)
+      printf '[跳过] %s %s（不改动）\n' "$status" "$id"
+      printf '  想收编进仓库：skillctl import %s --apply\n' "$link"
+      printf '  想保留原样：无需操作，skillctl 不会管理此目录\n'
+      return 0
+      ;;
+  esac
+  if [ "$apply" = "yes" ]; then
+    mkdir -p "$safe_destination"
+    ln -s "$relative_target" "$link"
+    APPLY_LINK_STATUS="managed"
+    printf '[已激活] %s -> %s\n' "$display" "$link"
+  else
+    printf '[预演] 激活 %s -> %s\n' "$display" "$link"
+  fi
+}
+
+deactivate_id() {
+  local destination_dir="$1" id="$2" apply="$3" entry relative_path target link status safe_destination relative_target
+  valid_skill_name "$id" || {
+    printf '[跳过] 非法 Skill ID %s\n' "$id"
+    return 0
+  }
+  entry="$(catalog_entry "$id")"
+  [ -n "$entry" ] || {
+    printf '[跳过] 未登记 Skill %s\n' "$id"
+    return 0
+  }
+  relative_path="${entry%%"$(printf '	')"*}"
+  target="$(physical_skill_target "$relative_path" 2>/dev/null || true)"
+  [ -n "$target" ] || {
+    printf '[跳过] 仓库缺少 %s\n' "$id"
+    return 0
+  }
+  safe_destination="$(safe_link_directory "$destination_dir" 2>/dev/null || true)"
+  [ -n "$safe_destination" ] || {
+    printf '[跳过] 目标路径含软链 %s\n' "$destination_dir"
+    return 0
+  }
+  link="$safe_destination/$id"
+  relative_target="$(relative_link_target "$safe_destination" "$target")"
+  status="$(link_conflict_status "$link" "$target" "$relative_target")"
+  case "$status" in
+    managed)
+      if [ "$apply" = "yes" ]; then
+        rm "$link"
+        printf '[已停用] %s\n' "$id"
+      else
+        printf '[预演] 停用 %s\n' "$id"
+      fi
+      ;;
+    missing)
+      printf '[已停用] %s\n' "$id"
+      ;;
+    *)
+      printf '[跳过] %s %s：该软链/目录非本工具托管，未改动\n' "$status" "$id"
+      ;;
+  esac
+}
+
+# 手动激活列表：记录通过 `activate <id> --apply` 单独激活（不经由场景包）的
+# skill id，一行一个。profile_ids() 把它并进目标集合，使 `profile use` 切换
+# 场景包时不会静默清掉这些手动激活的 skill；`deactivate`/归档会把对应 id
+# 移出这份名单。文件不存在时一律视为空，不是错误。
+resolve_manual_list_file() {
+  printf '%s\n' "$SKILL_LIBRARY_ROOT/state/manual.list"
+}
+
+read_manual_ids() {
+  local f
+  f="$(resolve_manual_list_file)"
+  [ -f "$f" ] || return 0
+  sed '/^[[:space:]]*$/d; /^[[:space:]]*#/d' "$f" | LC_ALL=C sort -u
+}
+
+manual_list_add() {
+  local id="$1" f dir tmp
+  f="$(resolve_manual_list_file)"
+  dir="$(dirname "$f")"
+  mkdir -p "$dir" || return 1
+  tmp="$(mktemp "$dir/.manual.list.XXXXXX")" || return 1
+  { read_manual_ids; printf '%s\n' "$id"; } | LC_ALL=C sort -u > "$tmp"
+  atomic_replace "$tmp" "$f"
+}
+
+manual_list_remove() {
+  local id="$1" f dir tmp
+  f="$(resolve_manual_list_file)"
+  [ -f "$f" ] || return 0
+  dir="$(dirname "$f")"
+  tmp="$(mktemp "$dir/.manual.list.XXXXXX")" || return 1
+  awk -v id="$id" '$0 != id' "$f" > "$tmp"
+  atomic_replace "$tmp" "$f"
+}
+
+profile_ids() {
+  local name="$1" profile
+  profile="$PROFILE_DIR/$name"
+  [ -f "$PROFILE_DIR/core" ] || return 1
+  [ -f "$profile" ] || return 1
+  {
+    sed '/^[[:space:]]*$/d; /^[[:space:]]*#/d' "$PROFILE_DIR/core"
+    [ "$name" = "core" ] || sed '/^[[:space:]]*$/d; /^[[:space:]]*#/d' "$profile"
+    read_manual_ids
+  } | LC_ALL=C sort -u
+}
+
+profile_contains_id() {
+  local desired_file="$1" id="$2"
+  grep -F -x "$id" "$desired_file" >/dev/null
+}
+
+replace_profile_links() {
+  local destination_dir="$1" profile_name="$2" apply="$3" desired_file prune_file id entry relative_path target link safe_destination
+  local prune_count prune_summary profiles_for_id
+  safe_destination="$(safe_link_directory "$destination_dir" 2>/dev/null || true)"
+  [ -n "$safe_destination" ] || {
+    printf '[跳过] 目标路径含软链 %s\n' "$destination_dir"
+    return 0
+  }
+  desired_file="$(mktemp "${TMPDIR:-/tmp}/skillctl-profile.XXXXXX")" || return 1
+  prune_file="$(mktemp "${TMPDIR:-/tmp}/skillctl-profile-prune.XXXXXX")" || { rm -f "$desired_file"; return 1; }
+  trap 'rm -f "$desired_file" "$prune_file"' RETURN
+  profile_ids "$profile_name" > "$desired_file" || {
+    printf '场景包不存在: %s\n' "$profile_name" >&2
+    return 1
+  }
+
+  : > "$prune_file"
+  prune_count=0
+  prune_summary=""
+  if [ -d "$safe_destination" ] && [ ! -L "$safe_destination" ]; then
+    for link in "$safe_destination"/* "$safe_destination"/.[!.]* "$safe_destination"/..?*; do
+      [ -L "$link" ] || continue
+      id="$(basename "$link")"
+      profile_contains_id "$desired_file" "$id" && continue
+      entry="$(catalog_entry "$id")"
+      [ -n "$entry" ] || continue
+      relative_path="${entry%%"$(printf '	')"*}"
+      target="$(physical_skill_target "$relative_path" 2>/dev/null || true)"
+      [ -n "$target" ] || continue
+      printf '%s\n' "$id" >> "$prune_file"
+      profiles_for_id="$(collect_profiles_for_id "$id")"
+      [ -n "$profiles_for_id" ] || profiles_for_id="未知来源"
+      prune_count=$((prune_count + 1))
+      if [ -n "$prune_summary" ]; then
+        prune_summary="${prune_summary}, ${id}（${profiles_for_id}）"
+      else
+        prune_summary="${id}（${profiles_for_id}）"
+      fi
+    done
+  fi
+
+  if [ "$prune_count" -gt 0 ]; then
+    printf '将停用 %s 个（不在 %s∪core∪手动激活列表内的现有成员）：%s\n' "$prune_count" "$profile_name" "$prune_summary"
+  fi
+
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    deactivate_id "$safe_destination" "$id" "$apply"
+  done < "$prune_file"
+
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    apply_link_for_id "$safe_destination" "$id" "$apply"
+  done < "$desired_file"
+  rm -f "$desired_file" "$prune_file"
+  trap - RETURN
+}
+
+require_project_directory() {
+  local project="$1"
+  case "$project" in
+    /*) ;;
+    *)
+      printf '项目路径必须是已存在的绝对目录\n' >&2
+      return 1
+      ;;
+  esac
+  real_dir "$project" || {
+    printf '项目路径必须是已存在的绝对目录\n' >&2
+    return 1
+  }
+}
+
+normalize_query() {
+  printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
+list_catalog() {
+  awk -F '\t' 'NF == 8 { print $3 "\t" $1 "\t" $8 }' "$CATALOG_FILE" | \
+    LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2
+}
+
+search_catalog() {
+  local query
+  query="$(normalize_query "$1")"
+  awk -F '\t' -v query="$query" '
+    function normalize(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return tolower(value)
+    }
+    NF == 8 {
+      id = normalize($1)
+      display = normalize($3)
+      aliases = normalize($4)
+      triggers = normalize($6)
+      description = normalize($8)
+      if (index(id, query) || index(display, query) || index(aliases, query) || index(triggers, query) || index(description, query)) {
+        print $3 "\t" $1 "\t" $8
+      }
+    }
+  ' "$CATALOG_FILE" | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2
+}
+
+route_candidates() {
+  local query output_length line_length line score id display description tab candidate_count
+  query="$(normalize_query "$1")"
+  output_length=0
+  candidate_count=0
+  tab="$(printf '\t')"
+
+  awk -F '\t' -v query="$query" '
+    function normalize(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return tolower(value)
+    }
+    function exact_in_csv(values, wanted, parts, count, index_value, item) {
+      count = split(values, parts, ",")
+      for (index_value = 1; index_value <= count; index_value++) {
+        item = normalize(parts[index_value])
+        if (item != "" && item == wanted) return 1
+      }
+      return 0
+    }
+    function contains_in_csv(values, wanted, parts, count, index_value, item) {
+      count = split(values, parts, ",")
+      for (index_value = 1; index_value <= count; index_value++) {
+        item = normalize(parts[index_value])
+        if (item != "" && index(wanted, item)) return 1
+      }
+      return 0
+    }
+    function trigger_score(values, wanted, parts, count, index_value, item, total) {
+      total = 0
+      count = split(values, parts, ",")
+      for (index_value = 1; index_value <= count; index_value++) {
+        item = normalize(parts[index_value])
+        if (item != "" && index(wanted, item)) total += 20
+      }
+      return total
+    }
+    function exclusion_score(values, wanted, parts, count, index_value, item, total) {
+      total = 0
+      count = split(values, parts, ",")
+      for (index_value = 1; index_value <= count; index_value++) {
+        item = normalize(parts[index_value])
+        if (item != "" && index(wanted, item)) total -= 80
+      }
+      return total
+    }
+    NF == 8 {
+      id = normalize($1)
+      display = normalize($3)
+      aliases = normalize($4)
+      category = normalize($5)
+      triggers = $6
+      excludes = $7
+      if (query == "") next
+
+      exact_name = (query == id || query == display)
+      exact_alias = exact_in_csv(aliases, query)
+      if (category == "system" && !exact_name && !exact_alias) next
+
+      if (exact_name) score = 100
+      else if (exact_alias) score = 95
+      else {
+        score = 0
+        if (index(query, display) || contains_in_csv(aliases, query)) score += 60
+        score += trigger_score(triggers, query)
+        score += exclusion_score(excludes, query)
+      }
+
+      if (score >= 20) print score "\t" $1 "\t" $3 "\t" $8
+    }
+  ' "$CATALOG_FILE" | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2 | \
+    while IFS="$(printf '\t')" read -r score id display description; do
+      line="${score}${tab}${id}${tab}${display}${tab}${description}"
+      line_length="$(printf '%s\n' "$line" | wc -m | tr -d ' ')"
+      if [ $((output_length + line_length)) -gt 1200 ]; then
+        continue
+      fi
+      printf '%s\n' "$line"
+      output_length=$((output_length + line_length))
+      candidate_count=$((candidate_count + 1))
+      [ "$candidate_count" -lt 3 ] || exit 0
+    done
+}
+
+expected_target() {
+  local relative_path target_dir target_name
+  relative_path="$1"
+  target_dir="$(dirname "$SKILL_LIBRARY_ROOT/$relative_path")"
+  target_name="$(basename "$SKILL_LIBRARY_ROOT/$relative_path")"
+  [ -d "$target_dir" ] || return 1
+  (cd "$target_dir" && printf '%s/%s\n' "$(pwd -P)" "$target_name")
+}
+
+link_status() {
+  local link="$1" relative_path="$2" expected destination safe_destination standard_target
+  if [ -L "$link" ]; then
+    expected="$(expected_target "$relative_path" 2>/dev/null || true)"
+    destination="$(dirname "$link")"
+    safe_destination="$(safe_link_directory "$destination" 2>/dev/null || true)"
+    if [ -n "$expected" ] && [ -n "$safe_destination" ]; then
+      standard_target="$(relative_link_target "$safe_destination" "$expected")"
+    else
+      standard_target=""
+    fi
+    if [ -n "$standard_target" ] && managed_link_matches "$link" "$expected" "$standard_target"; then
+      printf '已激活\n'
+    else
+      printf '外部软链冲突\n'
+    fi
+  elif [ -e "$link" ]; then
+    printf '真实目录冲突\n'
+  else
+    printf '\n'
+  fi
+}
+
+stored_status() {
+  local id="$1" relative_path="$2" archive_path
+  if [ -d "$SKILL_LIBRARY_ROOT/$relative_path" ]; then
+    printf '仓库中\n'
+  elif [ -d "$SKILL_LIBRARY_ROOT/archive/$id" ]; then
+    printf '已归档\n'
+  else
+    for archive_path in "$SKILL_LIBRARY_ROOT/archive/$id"-*; do
+      if [ -d "$archive_path" ]; then
+        printf '已归档\n'
+        return 0
+      fi
+    done
+    printf '缺失\n'
+  fi
+}
+
+print_status() {
+  local id relative_path display status project_status
+  while IFS="$(printf '\t')" read -r id relative_path display _aliases _category _triggers _excludes _description; do
+    [ -n "$id" ] || continue
+    status="$(link_status "$GLOBAL_SKILLS_DIR/$id" "$relative_path")"
+    [ -n "$status" ] || status="$(stored_status "$id" "$relative_path")"
+    printf '全局\t%s\t%s\t%s\n' "$status" "$display" "$id"
+
+    project_status="$(link_status "$PROJECT_SKILLS_DIR/$id" "$relative_path")"
+    if [ -n "$project_status" ]; then
+      printf '当前项目\t%s\t%s\t%s\n' "$project_status" "$display" "$id"
+    fi
+  done < "$CATALOG_FILE"
+}
+
+catalog_sha256() {
+  shasum -a 256 "$CATALOG_FILE" | awk '{ print $1 }'
+}
+
+valid_gate_timestamp() {
+  local evaluated_at="$1" evaluated_epoch current_epoch roundtrip
+  evaluated_epoch="$(LC_ALL=C date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$evaluated_at" '+%s' 2>/dev/null)" || return 1
+  roundtrip="$(LC_ALL=C date -u -r "$evaluated_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)" || return 1
+  [ "$roundtrip" = "$evaluated_at" ] || return 1
+  current_epoch="$(date -u '+%s')"
+  [ "$evaluated_epoch" -le "$current_epoch" ] || return 1
+  [ $((current_epoch - evaluated_epoch)) -le 2592000 ]
+}
+
+valid_gate_metric() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  decimal_at_least "$value" "0" && decimal_at_most "$value" "1"
+}
+
+decimal_compare() {
+  local left="$1" right="$2" left_integer right_integer left_fraction right_fraction index left_digit right_digit
+  left_integer="${left%%.*}"
+  right_integer="${right%%.*}"
+  left_fraction=""
+  right_fraction=""
+  case "$left" in *.*) left_fraction="${left#*.}" ;; esac
+  case "$right" in *.*) right_fraction="${right#*.}" ;; esac
+
+  while [ "${#left_integer}" -gt 1 ] && [ "${left_integer#0}" != "$left_integer" ]; do
+    left_integer="${left_integer#0}"
+  done
+  while [ "${#right_integer}" -gt 1 ] && [ "${right_integer#0}" != "$right_integer" ]; do
+    right_integer="${right_integer#0}"
+  done
+  while [ -n "$left_fraction" ] && [ "${left_fraction%0}" != "$left_fraction" ]; do
+    left_fraction="${left_fraction%0}"
+  done
+  while [ -n "$right_fraction" ] && [ "${right_fraction%0}" != "$right_fraction" ]; do
+    right_fraction="${right_fraction%0}"
+  done
+
+  if [ "${#left_integer}" -lt "${#right_integer}" ]; then return 1; fi
+  if [ "${#left_integer}" -gt "${#right_integer}" ]; then return 2; fi
+  if [[ "$left_integer" < "$right_integer" ]]; then return 1; fi
+  if [[ "$left_integer" > "$right_integer" ]]; then return 2; fi
+
+  index=0
+  while [ "$index" -lt "${#left_fraction}" ] || [ "$index" -lt "${#right_fraction}" ]; do
+    left_digit=0
+    right_digit=0
+    [ "$index" -ge "${#left_fraction}" ] || left_digit="${left_fraction:$index:1}"
+    [ "$index" -ge "${#right_fraction}" ] || right_digit="${right_fraction:$index:1}"
+    if [ "$left_digit" -lt "$right_digit" ]; then return 1; fi
+    if [ "$left_digit" -gt "$right_digit" ]; then return 2; fi
+    index=$((index + 1))
+  done
+  return 0
+}
+
+decimal_at_least() {
+  local result
+  if decimal_compare "$1" "$2"; then
+    return 0
+  else
+    result=$?
+  fi
+  [ "$result" -eq 2 ]
+}
+
+decimal_at_most() {
+  local result
+  if decimal_compare "$1" "$2"; then
+    return 0
+  else
+    result=$?
+  fi
+  [ "$result" -eq 1 ]
+}
+
+gate_metrics_enable_auto_route() {
+  local top1="$1" top3="$2" ambiguous_false_select="$3"
+  valid_gate_metric "$top1" && valid_gate_metric "$top3" && valid_gate_metric "$ambiguous_false_select" || return 1
+  decimal_at_least "$top1" "0.90" && decimal_at_least "$top3" "0.98" && decimal_at_most "$ambiguous_false_select" "0.05"
+}
+
+print_route_status() {
+  local gate_file stored_hash evaluated_at top1 top3 ambiguous_false_select auto_route current_hash
+  gate_file="$SKILL_LIBRARY_ROOT/state/router-gate.tsv"
+
+  if [ ! -f "$gate_file" ]; then
+    printf '自动选择未启用\n'
+    return 0
+  fi
+
+  if ! awk -F '\t' 'NR == 1 { if (NF != 6) exit 1; next } { exit 1 } END { if (NR != 1) exit 1 }' "$gate_file"; then
+    printf '自动选择未启用\n'
+    return 0
+  fi
+  IFS="$(printf '\t')" read -r stored_hash evaluated_at top1 top3 ambiguous_false_select auto_route < "$gate_file" || true
+  current_hash="$(catalog_sha256)"
+  if [ -n "$stored_hash" ] && [ -n "$evaluated_at" ] && [ -n "$top1" ] && [ -n "$top3" ] && [ -n "$ambiguous_false_select" ] && \
+    [ "$stored_hash" = "$current_hash" ] && [ "$auto_route" = "enabled" ] && valid_gate_timestamp "$evaluated_at" && \
+    gate_metrics_enable_auto_route "$top1" "$top3" "$ambiguous_false_select"; then
+    printf '自动选择已启用\n'
+  else
+    printf '自动选择未启用\n'
+  fi
+}
+
+path_is_ancestor() {
+  local ancestor="$1" descendant="$2"
+  [ "$ancestor" = "$descendant" ] && return 0
+  case "$descendant" in
+    "$ancestor"/*) return 0 ;;
+  esac
+  return 1
+}
+
+resolve_aliases_file() {
+  printf '%s\n' "${SKILL_ALIASES:-$PACKAGE_ROOT/config/aliases.tsv}"
+}
+
+rebuild_catalog_or_warn() {
+  local build_script aliases_file
+  build_script="$SCRIPT_DIR/build-catalog.sh"
+  aliases_file="$(resolve_aliases_file)"
+  [ -f "$build_script" ] || return 0
+  if ! SKILL_LIBRARY_ROOT="$SKILL_LIBRARY_ROOT" SKILL_ALIASES="$aliases_file" /bin/bash "$build_script" --apply >/dev/null 2>&1; then
+    printf '警告：目录未能刷新，仍使用之前的 catalog.tsv\n' >&2
+  fi
+}
+
+write_alias_row() {
+  local aliases_file="$1" id="$2" display_name="$3" alias_extra="$4" tmp
+  tmp="$(mktemp "$(dirname "$aliases_file")/.aliases.tsv.XXXXXX")" || return 1
+  awk -F '\t' -v id="$id" -v display="$display_name" -v extra="$alias_extra" '
+    BEGIN { OFS = "\t" }
+    $0 ~ /^#/ || NF == 0 { print; next }
+    $1 == id {
+      found = 1
+      if (display != "") $2 = display
+      if (extra != "") { if ($3 != "") $3 = $3 "," extra; else $3 = extra }
+      print
+      next
+    }
+    { print }
+    END {
+      if (!found) {
+        new_display = (display != "" ? display : id)
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n", id, new_display, extra, "imported", "", ""
+      }
+    }
+  ' "$aliases_file" > "$tmp"
+  atomic_replace "$tmp" "$aliases_file"
+}
+
+collect_profiles_for_id() {
+  local id="$1" file result=""
+  for file in "$PROFILE_DIR"/*; do
+    [ -f "$file" ] || continue
+    grep -F -x "$id" "$file" >/dev/null 2>&1 || continue
+    if [ -n "$result" ]; then result="$result,$(basename "$file")"; else result="$(basename "$file")"; fi
+  done
+  printf '%s\n' "$result"
+}
+
+ARCHIVE_MANAGED_LINK=""
+
+# doctor 的检查结果计数器，由 doctor_report() 累加，cmd_doctor() 在开始时重置。
+DOCTOR_OK=0
+DOCTOR_WARN=0
+DOCTOR_FAIL=0
+
+# lint 的检查结果计数器，由 lint_report() 累加，cmd_lint() 在开始时重置。
+LINT_OK=0
+LINT_WARN=0
+LINT_FAIL=0
+
+archive_check() {
+  local id="$1" relative_path target link expected destination safe_destination standard_target
+  relative_path="skills/$id"
+  target="$SKILL_LIBRARY_ROOT/$relative_path"
+  real_dir "$target" >/dev/null 2>&1 || { printf '仓库中没有 %s，无法归档\n' "$id" >&2; return 1; }
+
+  ARCHIVE_MANAGED_LINK=""
+  link="$GLOBAL_SKILLS_DIR/$id"
+  if [ -L "$link" ]; then
+    expected="$(expected_target "$relative_path" 2>/dev/null || true)"
+    destination="$(dirname "$link")"
+    safe_destination="$(safe_link_directory "$destination" 2>/dev/null || true)"
+    standard_target=""
+    if [ -n "$expected" ] && [ -n "$safe_destination" ]; then
+      standard_target="$(relative_link_target "$safe_destination" "$expected")"
+    fi
+    if [ -n "$standard_target" ] && managed_link_matches "$link" "$expected" "$standard_target"; then
+      ARCHIVE_MANAGED_LINK="$GLOBAL_SKILLS_DIR"
+    else
+      printf '无法确认归属的引用，停止归档：%s\n' "$link" >&2
+      return 1
+    fi
+  elif [ -e "$link" ]; then
+    printf '无法确认归属的引用，停止归档：%s\n' "$link" >&2
+    return 1
+  fi
+  return 0
+}
+
+archive_execute() {
+  local id="$1" managed="$2" relative_path target hash archived_at archive_id profiles manifest tmp_manifest
+  relative_path="skills/$id"
+  target="$SKILL_LIBRARY_ROOT/$relative_path"
+  hash="$(directory_content_hash "$target")" || return 1
+  archived_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  archive_id="$(date -u '+%Y%m%d-%H%M%S')-${hash:0:8}"
+  profiles="$(collect_profiles_for_id "$id")"
+
+  [ -z "$managed" ] || deactivate_id "$GLOBAL_SKILLS_DIR" "$id" "yes" >/dev/null
+  manual_list_remove "$id"
+
+  mkdir -p "$SKILL_LIBRARY_ROOT/archive/$id" || return 1
+  mv "$target" "$SKILL_LIBRARY_ROOT/archive/$id/$archive_id" || return 1
+
+  # archive_id has one-second resolution; re-archiving identical content
+  # within the same second reuses the same ID. Replace any stale manifest
+  # row for that ID instead of appending a duplicate, so a lookup by
+  # archive_id always finds exactly one (the current) row.
+  manifest="$SKILL_LIBRARY_ROOT/archive/$id/manifest.tsv"
+  tmp_manifest="$(mktemp "$SKILL_LIBRARY_ROOT/archive/$id/.manifest.tsv.XXXXXX")" || return 1
+  if [ -f "$manifest" ]; then
+    awk -F '\t' -v aid="$archive_id" '$2 != aid' "$manifest" > "$tmp_manifest"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$archive_id" "$hash" "$archived_at" "$profiles" "$managed" >> "$tmp_manifest"
+  mv "$tmp_manifest" "$manifest" || return 1
+  printf '%s\n' "$archive_id"
+}
+
+cmd_archive() {
+  local id="$1" apply="$2" archive_id
+  archive_check "$id" || return 1
+  if [ "$apply" != "yes" ]; then
+    printf '[预演] 归档 %s -> archive/%s/<archive_id>\n' "$id" "$id"
+    [ -n "$ARCHIVE_MANAGED_LINK" ] && printf '[预演] 归档将移除受管软链 %s/%s\n' "$ARCHIVE_MANAGED_LINK" "$id"
+    return 0
+  fi
+  archive_id="$(archive_execute "$id" "$ARCHIVE_MANAGED_LINK")" || { printf '归档失败：%s\n' "$id" >&2; return 1; }
+  printf '[已归档] %s -> archive/%s/%s\n' "$id" "$id" "$archive_id"
+  rebuild_catalog_or_warn
+  auto_rebuild_dashboard
+}
+
+restore_pick_archive_id() {
+  local id="$1" requested="$2" dir
+  if [ -n "$requested" ]; then
+    [ -d "$SKILL_LIBRARY_ROOT/archive/$id/$requested" ] && printf '%s\n' "$requested"
+    return 0
+  fi
+  for dir in "$SKILL_LIBRARY_ROOT/archive/$id"/*/; do
+    [ -d "$dir" ] || continue
+    basename "${dir%/}"
+  done | LC_ALL=C sort | tail -n 1
+}
+
+reactivate_from_manifest() {
+  local id="$1" archive_id="$2" manifest_row managed_field managed_dirs dest
+  manifest_row="$(awk -F '\t' -v aid="$archive_id" '$2 == aid { print; exit }' "$SKILL_LIBRARY_ROOT/archive/$id/manifest.tsv" 2>/dev/null || true)"
+  managed_field="$(printf '%s' "$manifest_row" | awk -F '\t' '{ print $6 }')"
+  [ -n "$managed_field" ] || return 0
+  IFS=',' read -ra managed_dirs <<< "$managed_field"
+  for dest in "${managed_dirs[@]}"; do
+    [ -n "$dest" ] || continue
+    apply_link_for_id "$dest" "$id" "yes"
+  done
+}
+
+cmd_restore() {
+  local id="$1" requested="$2" reactivate="$3" apply="$4" archive_id
+
+  real_dir "$SKILL_LIBRARY_ROOT/skills/$id" >/dev/null 2>&1 && {
+    printf '仓库已存在同名 Skill：%s\n' "$id" >&2
+    return 1
+  }
+
+  archive_id="$(restore_pick_archive_id "$id" "$requested")"
+  [ -n "$archive_id" ] || { printf '没有可恢复的归档版本：%s\n' "$id" >&2; return 1; }
+
+  if [ "$apply" != "yes" ]; then
+    printf '[预演] 恢复 %s -> skills/%s（版本 %s）\n' "$id" "$id" "$archive_id"
+    [ "$reactivate" = "yes" ] && printf '[预演] 恢复后重新激活受管软链\n'
+    return 0
+  fi
+
+  mv "$SKILL_LIBRARY_ROOT/archive/$id/$archive_id" "$SKILL_LIBRARY_ROOT/skills/$id" || {
+    printf '恢复失败：%s\n' "$id" >&2
+    return 1
+  }
+  printf '[已恢复] %s -> skills/%s\n' "$id" "$id"
+  rebuild_catalog_or_warn
+
+  if [ "$reactivate" = "yes" ]; then
+    reactivate_from_manifest "$id" "$archive_id"
+    auto_rebuild_dashboard
+  fi
+  return 0
+}
+
+rollback_replace() {
+  local id="$1" archive_id="$2"
+  mv "$SKILL_LIBRARY_ROOT/archive/$id/$archive_id" "$SKILL_LIBRARY_ROOT/skills/$id" 2>/dev/null || return 1
+  reactivate_from_manifest "$id" "$archive_id"
+  rebuild_catalog_or_warn
+  return 0
+}
+
+import_copy_into_warehouse() {
+  local real_source="$1" id="$2" staging_dir source_hash copied_hash
+  staging_dir="$SKILL_LIBRARY_ROOT/skills/.staging-$id"
+  mkdir -p "$SKILL_LIBRARY_ROOT/skills" 2>/dev/null || true
+  if ! mkdir "$staging_dir" 2>/dev/null; then
+    return 1
+  fi
+  if ! /usr/bin/ditto "$real_source" "$staging_dir/$id" 2>/dev/null; then
+    rm -rf "$staging_dir"
+    return 1
+  fi
+  source_hash="$(directory_content_hash "$real_source")" || { rm -rf "$staging_dir"; return 1; }
+  copied_hash="$(directory_content_hash "$staging_dir/$id" 2>/dev/null || true)"
+  if [ "$source_hash" != "$copied_hash" ]; then
+    rm -rf "$staging_dir"
+    return 1
+  fi
+  if ! mv "$staging_dir/$id" "$SKILL_LIBRARY_ROOT/skills/$id"; then
+    rm -rf "$staging_dir"
+    return 1
+  fi
+  rmdir "$staging_dir" 2>/dev/null || true
+  return 0
+}
+
+cmd_import() {
+  local source display_name="" alias_extra="" activate="no" replace="no" apply="no"
+  [ "$#" -ge 1 ] || { usage >&2; return 2; }
+  source="$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --display-name)
+        [ "$#" -ge 2 ] || { usage >&2; return 2; }
+        display_name="$2"
+        shift 2
+        ;;
+      --alias)
+        [ "$#" -ge 2 ] || { usage >&2; return 2; }
+        if [ -n "$alias_extra" ]; then alias_extra="$alias_extra,$2"; else alias_extra="$2"; fi
+        shift 2
+        ;;
+      --activate) activate="yes"; shift ;;
+      --replace) replace="yes"; shift ;;
+      --apply) apply="yes"; shift ;;
+      *) usage >&2; return 2 ;;
+    esac
+  done
+
+  case "$source" in
+    /*) ;;
+    *) printf '来源必须是已存在的绝对目录\n' >&2; return 2 ;;
+  esac
+  local real_source
+  real_source="$(real_dir "$source" 2>/dev/null || true)"
+  [ -n "$real_source" ] || { printf '来源必须是已存在的绝对目录\n' >&2; return 2; }
+
+  local library_real
+  library_real="$(real_dir "$SKILL_LIBRARY_ROOT" 2>/dev/null || true)"
+  if [ -n "$library_real" ]; then
+    if path_is_ancestor "$library_real" "$real_source"; then
+      printf '来源不能位于仓库内部：%s\n' "$real_source" >&2
+      return 1
+    fi
+    if path_is_ancestor "$real_source" "$library_real"; then
+      printf '来源是仓库的祖先目录，拒绝递归导入：%s\n' "$real_source" >&2
+      return 1
+    fi
+  fi
+
+  [ -f "$real_source/SKILL.md" ] || { printf '来源缺少 SKILL.md：%s\n' "$real_source" >&2; return 1; }
+  local id
+  id="$(skill_declared_name "$real_source" 2>/dev/null || true)"
+  valid_skill_name "$id" || { printf '来源 SKILL.md 缺少合法 name 字段\n' >&2; return 1; }
+
+  local aliases_file existing_display
+  aliases_file="$(resolve_aliases_file)"
+  [ -f "$aliases_file" ] || { printf '中文别名配置不存在：%s\n' "$aliases_file" >&2; return 1; }
+  existing_display="$(awk -F '\t' -v id="$id" '$1 == id { print $2; exit }' "$aliases_file")"
+  local display_defaulted="no"
+  if [ -z "$existing_display" ] && [ -z "$display_name" ]; then
+    display_name="$id"
+    display_defaulted="yes"
+  fi
+
+  local source_hash target_dir mode target_hash
+  source_hash="$(directory_content_hash "$real_source")" || { printf '无法读取来源内容\n' >&2; return 1; }
+  target_dir="$SKILL_LIBRARY_ROOT/skills/$id"
+  mode="new"
+  if real_dir "$target_dir" >/dev/null 2>&1; then
+    target_hash="$(directory_content_hash "$target_dir" 2>/dev/null || true)"
+    if [ -n "$target_hash" ] && [ "$target_hash" = "$source_hash" ]; then
+      printf '[已存在] %s 内容相同，无需变更\n' "$id"
+      return 0
+    fi
+    if [ "$replace" != "yes" ]; then
+      printf '仓库已存在内容不同的 %s，如需替换请使用 --replace --apply\n' "$id" >&2
+      return 1
+    fi
+    mode="replace"
+  elif [ -e "$target_dir" ]; then
+    printf '仓库路径被占用且不是可识别的 Skill 目录：%s\n' "$target_dir" >&2
+    return 1
+  fi
+
+  if [ "$apply" != "yes" ]; then
+    if [ "$mode" = "replace" ]; then
+      printf '[预演] 替换 %s（旧版本先归档）-> skills/%s\n' "$id" "$id"
+    else
+      printf '[预演] 导入 %s -> skills/%s\n' "$id" "$id"
+    fi
+    if [ "$display_defaulted" = "yes" ]; then
+      printf '[预演] 未提供 --display-name，display_name 默认等于 id：%s\n' "$id"
+    elif [ -n "$display_name" ] || [ -n "$alias_extra" ]; then
+      printf '[预演] 写入别名 %s\n' "$id"
+    fi
+    [ "$activate" = "yes" ] && printf '[预演] 导入后激活 %s\n' "$id"
+    return 0
+  fi
+
+  local archived_old_id=""
+  if [ "$mode" = "replace" ]; then
+    archive_check "$id" || { printf '归档旧版本失败，导入终止\n' >&2; return 1; }
+    archived_old_id="$(archive_execute "$id" "$ARCHIVE_MANAGED_LINK")" || {
+      printf '归档旧版本失败，导入终止\n' >&2
+      return 1
+    }
+  fi
+
+  if ! import_copy_into_warehouse "$real_source" "$id"; then
+    if [ -n "$archived_old_id" ]; then
+      if rollback_replace "$id" "$archived_old_id"; then
+        printf '导入新版本失败，已回滚到旧版本\n' >&2
+      else
+        printf '导入新版本失败，回滚也失败，请手动检查 archive/%s/%s\n' "$id" "$archived_old_id" >&2
+      fi
+    else
+      printf '导入失败\n' >&2
+    fi
+    return 1
+  fi
+
+  local row_exists
+  row_exists="$(awk -F '\t' -v id="$id" '$1 == id { f = 1 } END { print f + 0 }' "$aliases_file")"
+  if [ "$row_exists" = "0" ] || [ -n "$display_name" ] || [ -n "$alias_extra" ]; then
+    write_alias_row "$aliases_file" "$id" "$display_name" "$alias_extra"
+  fi
+
+  rebuild_catalog_or_warn
+
+  if [ "$activate" = "yes" ]; then
+    apply_link_for_id "$GLOBAL_SKILLS_DIR" "$id" "yes"
+    auto_rebuild_dashboard
+  fi
+  printf '[已导入] %s -> skills/%s\n' "$id" "$id"
+}
+
+# 只读操作，不需要 --apply：只是把仓库里已有内容原样拷一份到仓库外，不改
+# 仓库、不改 catalog、不改软链状态。导出天然是"干净"的——skillctl 自己的
+# 登记信息（catalog.tsv 的行、archive manifest、state/ 下的记录）本来就存在
+# 仓库层面，从不写进 Skill 自己的目录里，所以只要 ditto 这个目录本身，输出
+# 就已经只含 SKILL.md 和内容文件，不用额外过滤。
+cmd_export() {
+  local id="$1" output="$2" entry relative_path target destination source_hash copied_hash parent
+
+  entry="$(catalog_entry "$id")"
+  [ -n "$entry" ] || { printf '未登记 Skill：%s；不知道 id 就先 skillctl status 或 skillctl search <关键词>\n' "$id" >&2; return 1; }
+  relative_path="${entry%%"$(printf '\t')"*}"
+  target="$(physical_skill_target "$relative_path" 2>/dev/null || true)"
+  [ -n "$target" ] || { printf '仓库缺少 Skill 内容：%s\n' "$id" >&2; return 1; }
+
+  if [ -n "$output" ]; then
+    case "$output" in
+      /*) ;;
+      *) printf -- '--output 必须是绝对路径\n' >&2; return 2 ;;
+    esac
+    destination="$output"
+  else
+    destination="$HOME/Desktop/skill-export-$id"
+  fi
+
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    printf '目标已存在：%s；换个路径或先清理\n' "$destination" >&2
+    return 1
+  fi
+
+  parent="$(dirname "$destination")"
+  mkdir -p "$parent" 2>/dev/null || { printf '无法创建目标所在目录：%s\n' "$parent" >&2; return 1; }
+
+  if ! /usr/bin/ditto "$target" "$destination" 2>/dev/null; then
+    rm -rf "$destination"
+    printf '导出失败：%s\n' "$id" >&2
+    return 1
+  fi
+  source_hash="$(directory_content_hash "$target")" || { rm -rf "$destination"; printf '无法读取仓库内容\n' >&2; return 1; }
+  copied_hash="$(directory_content_hash "$destination" 2>/dev/null || true)"
+  if [ "$source_hash" != "$copied_hash" ]; then
+    rm -rf "$destination"
+    printf '导出内容校验失败，已清理不完整的输出：%s\n' "$destination" >&2
+    return 1
+  fi
+
+  printf '[已导出] %s -> %s\n' "$id" "$destination"
+  printf '只含 SKILL.md 与内容目录，不带仓库登记信息，可直接上传到 claude.ai 账户库或分享给他人\n'
+}
+
+resolve_adapters_file() {
+  printf '%s\n' "${SKILL_ADAPTERS:-$PACKAGE_ROOT/config/adapters/tools.tsv}"
+}
+
+expand_tilde() {
+  # 不依赖 shell 的 tilde 展开（那对带引号的字符串本来就不生效）——这里是
+  # 显式用参数展开去掉字面 ~ 前缀，再手动拼上 $HOME，是故意的写法。
+  # shellcheck disable=SC2088
+  case "$1" in
+    "~"|"~/"*) printf '%s\n' "$HOME${1#\~}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+adapter_row() {
+  local id="$1" adapters_file="$2"
+  awk -F '\t' -v id="$id" '$0 !~ /^#/ && $1 == id { print; exit }' "$adapters_file"
+}
+
+# bash's `read` treats tab as "IFS whitespace" and collapses consecutive
+# delimiters even when IFS is set to tab alone, silently dropping empty
+# fields and shifting everything after them (macOS ships bash 3.2, whose
+# `read` also fails to split on control-character IFS like $'\001', so a
+# control char doesn't fix it either). Swap tabs for `;`, a plain character
+# outside the whitespace class, so empty fields (e.g. no cli_command)
+# survive. None of the adapter columns are expected to contain `;`.
+tsv_to_read_safe() {
+  tr '\t' ';' <<< "$1"
+}
+
+detect_status_for_row() {
+  local mode="$1" global_dir="$2" cli_command="$3" app_name="$4" resolved_dir
+  if { [ -n "$app_name" ] && [ -d "$APPLICATIONS_DIR/$app_name.app" ]; } || \
+     { [ -n "$cli_command" ] && command -v "$cli_command" >/dev/null 2>&1; }; then
+    printf '已检测\n'
+    return 0
+  fi
+  # native adapters all share the same global skills directory, so its mere
+  # existence is not tool-specific evidence; only link adapters get the
+  # "residual directory" fallback.
+  if [ "$mode" = "link" ]; then
+    resolved_dir="$(expand_tilde "$global_dir")"
+    if [ -d "$resolved_dir" ] && [ ! -L "$resolved_dir" ]; then
+      printf '可能是残留目录\n'
+      return 0
+    fi
+  fi
+  printf '未检测到\n'
+}
+
+cmd_tools_detect() {
+  local adapters_file id display mode global_dir _project_dir cli_command app_name verification status mode_label
+  adapters_file="$(resolve_adapters_file)"
+  [ -f "$adapters_file" ] || { printf '软件适配器配置不存在：%s\n' "$adapters_file" >&2; return 1; }
+  while IFS=';' read -r id display mode global_dir _project_dir cli_command app_name verification; do
+    [ -n "$id" ] || continue
+    case "$id" in \#*) continue ;; esac
+    status="$(detect_status_for_row "$mode" "$global_dir" "$cli_command" "$app_name")"
+    if [ "$mode" = "native" ]; then mode_label="原生"; else mode_label="软链"; fi
+    printf '%s\t%s\t%s\n' "$id" "$status" "$mode_label"
+  done < <(tr '\t' ';' < "$adapters_file")
+}
+
+cmd_tools_connect() {
+  local id="$1" apply="$2" allow_unverified="$3" prune="$4" adapters_file row
+  local _id display mode global_dir _project_dir cli_command app_name verification resolved_dir sync_script
+  local -a sync_args
+
+  adapters_file="$(resolve_adapters_file)"
+  [ -f "$adapters_file" ] || { printf '软件适配器配置不存在：%s\n' "$adapters_file" >&2; return 1; }
+  row="$(adapter_row "$id" "$adapters_file")"
+  [ -n "$row" ] || { printf '未知适配器：%s\n' "$id" >&2; return 1; }
+  IFS=';' read -r _id display mode global_dir _project_dir cli_command app_name verification <<< "$(tsv_to_read_safe "$row")"
+
+  if [ "$mode" = "native" ]; then
+    printf '[信息] %s 为原生模式，自动共享 %s，无需连接\n' "$display" "$GLOBAL_SKILLS_DIR"
+    return 0
+  fi
+
+  if [ "$verification" = "unverified" ] && [ "$allow_unverified" != "yes" ]; then
+    printf '%s 尚未验证，如需连接请加上 --allow-unverified\n' "$display" >&2
+    return 1
+  fi
+
+  resolved_dir="$(expand_tilde "$global_dir")"
+  sync_script="$SCRIPT_DIR/sync-skills.sh"
+  [ -f "$sync_script" ] || { printf '同步脚本不存在：%s\n' "$sync_script" >&2; return 1; }
+
+  sync_args=(--target "$resolved_dir")
+  [ "$prune" = "yes" ] && sync_args+=(--prune)
+  [ "$apply" = "yes" ] && sync_args+=(--apply)
+
+  SKILLS_SRC="$GLOBAL_SKILLS_DIR" SKILL_ADAPTERS="$adapters_file" /bin/bash "$sync_script" "${sync_args[@]}"
+}
+
+cmd_tools_disconnect() {
+  local id="$1" apply="$2" adapters_file row
+  local _id display mode global_dir _project_dir cli_command app_name verification resolved_dir sync_script
+
+  adapters_file="$(resolve_adapters_file)"
+  [ -f "$adapters_file" ] || { printf '软件适配器配置不存在：%s\n' "$adapters_file" >&2; return 1; }
+  row="$(adapter_row "$id" "$adapters_file")"
+  [ -n "$row" ] || { printf '未知适配器：%s\n' "$id" >&2; return 1; }
+  IFS=';' read -r _id display mode global_dir _project_dir cli_command app_name verification <<< "$(tsv_to_read_safe "$row")"
+
+  if [ "$mode" = "native" ]; then
+    printf '[信息] %s 为原生模式，没有独立的受管软链需要断开\n' "$display"
+    return 0
+  fi
+
+  resolved_dir="$(expand_tilde "$global_dir")"
+  sync_script="$SCRIPT_DIR/sync-skills.sh"
+  [ -f "$sync_script" ] || { printf '同步脚本不存在：%s\n' "$sync_script" >&2; return 1; }
+
+  if [ "$apply" = "yes" ]; then
+    SKILLS_SRC="$GLOBAL_SKILLS_DIR" SKILL_ADAPTERS="$adapters_file" /bin/bash "$sync_script" --target "$resolved_dir" --disconnect --apply
+  else
+    SKILLS_SRC="$GLOBAL_SKILLS_DIR" SKILL_ADAPTERS="$adapters_file" /bin/bash "$sync_script" --target "$resolved_dir" --disconnect
+  fi
+}
+
+cmd_dashboard_build() {
+  local apply="$1" build_script
+  build_script="$SCRIPT_DIR/build-dashboard.sh"
+  [ -f "$build_script" ] || { printf '面板生成脚本不存在：%s\n' "$build_script" >&2; return 1; }
+  if [ "$apply" = "yes" ]; then
+    /bin/bash "$build_script" --apply
+  else
+    /bin/bash "$build_script"
+  fi
+}
+
+cmd_dashboard_open() {
+  local html="$SKILL_LIBRARY_ROOT/dashboard/index.html"
+  [ -f "$html" ] || { printf '面板尚未生成，请先运行 skillctl dashboard build --apply\n' >&2; return 1; }
+  open "$html"
+}
+
+# 判断一个软链是否"归属仓库"：把软链一路解析到最终真实路径，只要落在
+# $SKILL_LIBRARY_ROOT/skills 之下（不管中间经过几层——直接指向仓库，或者
+# 先指向 GLOBAL_SKILLS_DIR 再由它指向仓库），就认定是 skillctl 建立的托管
+# 软链。不认识的外部软链一律跳过，不动。
+eject_link_is_repo_managed() {
+  local link="$1" real repo_real
+  [ -L "$link" ] || return 1
+  real="$(cd "$link" 2>/dev/null && pwd -P)" || return 1
+  repo_real="$(real_dir "$SKILL_LIBRARY_ROOT/skills" 2>/dev/null || true)"
+  [ -n "$repo_real" ] || return 1
+  path_is_ancestor "$repo_real" "$real"
+}
+
+# 先对所有目标目录做一次只读扫描，把"哪些软链归属仓库、当前分别指向哪个
+# 真实路径"整体记录进一个 dir;name;real 三列的计划文件，再统一执行。
+# 不能一边扫描一边就地物化：如果先把 GLOBAL_SKILLS_DIR 下的软链换成了真实
+# 拷贝，紧接着再扫描某个工具自己目录下"经过 GLOBAL_SKILLS_DIR 转一手"的
+# 软链时，它已经不再解析到仓库（因为链路中间那一段已经是真实目录了），会
+# 被误判成"不归属仓库"而被跳过——用一份预先固定的计划文件从根源上避免这
+# 种"先处理的目标影响后处理的目标判断结果"的顺序依赖。
+eject_build_plan() {
+  local plan_file="$1" dir link name real
+  shift
+  : > "$plan_file"
+  for dir in "$@"; do
+    for link in "$dir"/*; do
+      [ -L "$link" ] || continue
+      eject_link_is_repo_managed "$link" || continue
+      name="$(basename "$link")"
+      real="$(cd "$link" && pwd -P)"
+      printf '%s;%s;%s\n' "$dir" "$name" "$real" >> "$plan_file"
+    done
+  done
+}
+
+# 按计划文件里属于某个目录的记录逐条执行（或预演）：apply 模式下 ditto 到
+# 暂存名，确认拷贝成功后才原地把软链换成真实目录（跟 import_copy_into_
+# warehouse 一样，只在拷贝确认成功后才动原软链，避免中间态）。
+eject_physicalize_planned() {
+  local dir="$1" apply="$2" plan_file="$3"
+  local p_dir p_name p_real link tmp_parent tmp failed=0 count=0
+  while IFS=';' read -r p_dir p_name p_real; do
+    [ "$p_dir" = "$dir" ] || continue
+    count=$((count + 1))
+    link="$dir/$p_name"
+    if [ "$apply" != "yes" ]; then
+      printf '  [预演] 物化 %s（复制自 %s）\n' "$link" "$p_real"
+      continue
+    fi
+    tmp_parent="$(mktemp -d "$dir/.eject-XXXXXX" 2>/dev/null)" || {
+      printf '  [失败] 无法创建暂存目录，跳过：%s\n' "$link" >&2
+      failed=1
+      continue
+    }
+    tmp="$tmp_parent/$p_name"
+    if ! /usr/bin/ditto "$p_real" "$tmp"; then
+      printf '  [失败] 复制失败，保留原软链：%s\n' "$link" >&2
+      rm -rf "$tmp_parent"
+      failed=1
+      continue
+    fi
+    rm -f "$link"
+    mv "$tmp" "$link"
+    rmdir "$tmp_parent" 2>/dev/null || true
+    printf '  [已物化] %s\n' "$link"
+  done < "$plan_file"
+  [ "$count" -eq 0 ] && printf '  没有受管软链\n'
+  [ "$failed" -eq 0 ]
+}
+
+cmd_eject() {
+  local apply="$1" adapters_file id display mode global_dir _project_dir cli_command app_name verification
+  local resolved_dir safe_dir safe_global target backup_root backup_name idx failed=0 plan_file
+  local plan_count plan_dir_count
+  local -a targets=() target_labels=()
+
+  safe_global="$(safe_link_directory "$GLOBAL_SKILLS_DIR" 2>/dev/null || true)"
+  if [ -n "$safe_global" ] && [ -d "$safe_global" ] && [ ! -L "$safe_global" ]; then
+    targets+=("$safe_global")
+    target_labels+=("${GLOBAL_SKILLS_DIR}（全局共享目录，原生工具直接读取这里）")
+  fi
+
+  adapters_file="$(resolve_adapters_file)"
+  if [ -f "$adapters_file" ]; then
+    while IFS=';' read -r id display mode global_dir _project_dir cli_command app_name verification; do
+      [ -n "$id" ] || continue
+      case "$id" in \#*) continue ;; esac
+      [ "$mode" = "link" ] || continue
+      resolved_dir="$(expand_tilde "$global_dir")"
+      safe_dir="$(safe_link_directory "$resolved_dir" 2>/dev/null || true)"
+      [ -n "$safe_dir" ] && [ -d "$safe_dir" ] && [ ! -L "$safe_dir" ] || continue
+      targets+=("$safe_dir")
+      target_labels+=("${display}（${id}）")
+    done < <(tr '\t' ';' < "$adapters_file")
+  fi
+
+  if [ "${#targets[@]}" -eq 0 ]; then
+    printf '没有发现受管软链目录，无需 eject\n'
+    return 0
+  fi
+
+  plan_file="$(mktemp "${TMPDIR:-/tmp}/skillctl-eject-plan.XXXXXX")" || {
+    printf '无法创建临时计划文件，eject 中止\n' >&2
+    return 1
+  }
+  trap 'rm -f "$plan_file"' RETURN
+  eject_build_plan "$plan_file" "${targets[@]}"
+
+  if [ ! -s "$plan_file" ]; then
+    printf '没有发现受管软链目录，无需 eject\n'
+    return 0
+  fi
+
+  plan_count="$(wc -l < "$plan_file" | tr -d ' ')"
+  plan_dir_count="$(awk -F ';' '{print $1}' "$plan_file" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+
+  if [ "$apply" != "yes" ]; then
+    printf '[预演] eject 将把 %s 条受管软链物化为独立真实拷贝，涉及 %s 个目录：\n' "$plan_count" "$plan_dir_count"
+    printf '备份位置（示意路径，实际时间戳以 --apply 执行时为准）：%s/eject-backups/<时间戳>/\n\n' "$SKILL_LIBRARY_ROOT"
+    idx=0
+    for target in "${targets[@]}"; do
+      printf '── %s\n' "${target_labels[$idx]}"
+      eject_physicalize_planned "$target" "no" "$plan_file"
+      printf '\n'
+      idx=$((idx + 1))
+    done
+    printf '确认后运行：skillctl eject --apply\n'
+    return 0
+  fi
+
+  backup_root="$SKILL_LIBRARY_ROOT/eject-backups/$(date -u '+%Y%m%d-%H%M%S')"
+  mkdir -p "$backup_root" || { printf '备份目录创建失败，eject 中止\n' >&2; return 1; }
+  idx=0
+  for target in "${targets[@]}"; do
+    idx=$((idx + 1))
+    backup_name="$idx-$(basename "$target")"
+    if ! /usr/bin/ditto "$target" "$backup_root/$backup_name"; then
+      printf '备份失败：%s，eject 中止（此前已生成的部分备份见 %s）\n' "$target" "$backup_root" >&2
+      return 1
+    fi
+  done
+  printf '已备份将改动的目录到: %s\n\n' "$backup_root"
+
+  printf '开始物化 %s 条受管软链，涉及 %s 个目录：\n\n' "$plan_count" "$plan_dir_count"
+  idx=0
+  for target in "${targets[@]}"; do
+    printf '── %s\n' "${target_labels[$idx]}"
+    eject_physicalize_planned "$target" "yes" "$plan_file" || failed=1
+    printf '\n'
+    idx=$((idx + 1))
+  done
+
+  if [ "$failed" -eq 1 ]; then
+    printf '部分目录物化失败，改动前的备份见 %s，请人工核查后重试\n' "$backup_root" >&2
+    return 1
+  fi
+
+  printf '已脱离 skillctl 管理，各工具目录现为独立副本，仓库目录 %s 可自行保留或删除\n' "$SKILL_LIBRARY_ROOT"
+}
+
+doctor_report() {
+  local level="$1" message="$2" fix="${3:-}"
+  case "$level" in
+    ok)
+      DOCTOR_OK=$((DOCTOR_OK + 1))
+      printf '✅ %s\n' "$message"
+      ;;
+    warn)
+      DOCTOR_WARN=$((DOCTOR_WARN + 1))
+      printf '⚠️ %s\n' "$message"
+      [ -z "$fix" ] || printf '   → %s\n' "$fix"
+      ;;
+    fail)
+      DOCTOR_FAIL=$((DOCTOR_FAIL + 1))
+      printf '❌ %s\n' "$message"
+      [ -z "$fix" ] || printf '   → %s\n' "$fix"
+      ;;
+  esac
+}
+
+doctor_check_global_broken_links() {
+  local link id
+  [ -d "$GLOBAL_SKILLS_DIR" ] && [ ! -L "$GLOBAL_SKILLS_DIR" ] || return 0
+  for link in "$GLOBAL_SKILLS_DIR"/*; do
+    [ -L "$link" ] || continue
+    [ -e "$link" ] && continue
+    id="$(basename "$link")"
+    doctor_report fail "断链：$GLOBAL_SKILLS_DIR/$id 指向的仓库内容不存在" \
+      "人工确认该 Skill 是否已被手动移出仓库；确认后 rm \"$GLOBAL_SKILLS_DIR/$id\" 清理，或把内容放回仓库后 skillctl activate $id --apply 重新建链"
+  done
+  return 0
+}
+
+doctor_check_tool_broken_links() {
+  local adapters_file id display mode global_dir _project_dir cli_command app_name verification resolved_dir link name
+  adapters_file="$(resolve_adapters_file)"
+  [ -f "$adapters_file" ] || return 0
+  while IFS=';' read -r id display mode global_dir _project_dir cli_command app_name verification; do
+    [ -n "$id" ] || continue
+    case "$id" in \#*) continue ;; esac
+    [ "$mode" = "link" ] || continue
+    resolved_dir="$(expand_tilde "$global_dir")"
+    [ -d "$resolved_dir" ] && [ ! -L "$resolved_dir" ] || continue
+    for link in "$resolved_dir"/*; do
+      [ -L "$link" ] || continue
+      [ -e "$link" ] && continue
+      name="$(basename "$link")"
+      doctor_report fail "断链：${display}（${id}）下的 $name 指向不存在的目标" \
+        "skillctl tools connect $id --prune --apply"
+    done
+  done < <(tr '\t' ';' < "$adapters_file")
+  return 0
+}
+
+# 用 DOCTOR_FAIL 计数器前后差值判断这一组检查是否发现了问题，不依赖子函数
+# 的返回码——这个项目已经在 deactivate 分支上因为裸 `&&` 影响退出码踩过一次
+# 坑（见 CLAUDE.md），这里改用计数器差值从根源上绕开同类风险。
+doctor_check_broken_links() {
+  local before
+  before="$DOCTOR_FAIL"
+  doctor_check_global_broken_links
+  doctor_check_tool_broken_links
+  if [ "$DOCTOR_FAIL" = "$before" ]; then
+    doctor_report ok "没有发现断链"
+  fi
+}
+
+# 断链检查（doctor_check_broken_links）是"货架上的软链指向仓库里已经不存在
+# 的内容"；这里反过来查"货架上有真实目录（不是软链），仓库根本不认识"——
+# 典型场景是直接让 AI 工具把新技能装到 ~/.agents/skills 或 ~/.claude/skills
+# 这类原生扫描目录，而不是走 skillctl import，内容看似"装好了"，实际上
+# 仓库和面板都不知道它存在。只查一层，不递归；只认"目录里有 SKILL.md"的
+# 才算数，避免把货架下面的杂散文件/临时目录也报进来。
+doctor_check_shelf_orphans_dir() {
+  local dir="$1" entry id declared display
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+  for entry in "$dir"/*; do
+    [ -d "$entry" ] && [ ! -L "$entry" ] || continue
+    [ -f "$entry/SKILL.md" ] || continue
+    declared="$(skill_declared_name "$entry" 2>/dev/null || true)"
+    id="$(basename "$entry")"
+    if [ -n "$declared" ]; then
+      [ -n "$(catalog_entry "$declared")" ] && continue
+    else
+      [ -n "$(catalog_entry "$id")" ] && continue
+    fi
+    display="${declared:-$id}"
+    doctor_report warn "货架目录 $dir 下的 $display 是真实目录，不是仓库管理的软链，仓库和面板都不认识它" \
+      "确认内容无误后 skillctl import \"$entry\" --activate --apply 收编进仓库"
+  done
+  return 0
+}
+
+doctor_check_shelf_orphans() {
+  local before seen adapters_file id display mode global_dir _project_dir _cli_command _app_name _verification resolved_dir
+  before="$DOCTOR_WARN"
+
+  doctor_check_shelf_orphans_dir "$GLOBAL_SKILLS_DIR"
+  seen=",$GLOBAL_SKILLS_DIR,"
+
+  adapters_file="$(resolve_adapters_file)"
+  if [ -f "$adapters_file" ]; then
+    while IFS=';' read -r id display mode global_dir _project_dir _cli_command _app_name _verification; do
+      [ -n "$id" ] || continue
+      case "$id" in \#*) continue ;; esac
+      [ "$mode" = "link" ] || continue
+      resolved_dir="$(expand_tilde "$global_dir")"
+      case "$seen" in *",$resolved_dir,"*) continue ;; esac
+      seen="$seen$resolved_dir,"
+      doctor_check_shelf_orphans_dir "$resolved_dir"
+    done < <(tr '\t' ';' < "$adapters_file")
+  fi
+
+  [ "$DOCTOR_WARN" = "$before" ] && doctor_report ok "货架上没有发现未收编进仓库的真实目录"
+  return 0
+}
+
+doctor_check_tools() {
+  local adapters_file id display mode global_dir _project_dir cli_command app_name verification status resolved_dir keyword candidates
+  adapters_file="$(resolve_adapters_file)"
+  [ -f "$adapters_file" ] || {
+    doctor_report fail "软件适配器配置不存在：$adapters_file" "检查安装是否完整（config/adapters/tools.tsv 缺失）"
+    return 0
+  }
+  while IFS=';' read -r id display mode global_dir _project_dir cli_command app_name verification; do
+    [ -n "$id" ] || continue
+    case "$id" in \#*) continue ;; esac
+    status="$(detect_status_for_row "$mode" "$global_dir" "$cli_command" "$app_name")"
+    case "$status" in
+      已检测)
+        doctor_report ok "${display}（${id}）已检测到"
+        ;;
+      可能是残留目录)
+        resolved_dir="$(expand_tilde "$global_dir")"
+        doctor_report warn "${display}（${id}）只发现残留的软链目录 ${resolved_dir}，工具本身可能已卸载或未运行过" \
+          "仍在用就先运行一次该工具；确认不再使用可以 skillctl tools disconnect $id --apply 清理"
+        ;;
+      未检测到)
+        candidates=""
+        keyword="${id%%-*}"
+        if [ -n "$app_name" ] && [ -d "$APPLICATIONS_DIR" ]; then
+          # candidates 只用来拼一行诊断文字给人看，不会再按行/按词拆开处理，
+          # 应用文件夹名里出现换行这种边缘情况顶多让这行提示变丑，不影响正确性。
+          # shellcheck disable=SC2010
+          candidates="$(ls -1 "$APPLICATIONS_DIR" 2>/dev/null | grep -i -- "$keyword" || true)"
+        fi
+        if [ -n "$candidates" ]; then
+          doctor_report warn "${display}（${id}）按配置的 app_name「${app_name}」未检测到，但 /Applications 下发现疑似同类文件夹：$(printf '%s' "$candidates" | tr '\n' '、')" \
+            "确认这就是 $display 之后，手动把 tools.tsv 里 $id 这行的 app_name 改成真实文件夹名"
+        else
+          doctor_report warn "${display}（${id}）未检测到" \
+            "先安装/运行一次该工具；如果确认已安装但显示名不同，用 ls /Applications | grep -i $keyword 核实后修正 tools.tsv 里的 app_name"
+        fi
+        ;;
+    esac
+  done < <(tr '\t' ';' < "$adapters_file")
+}
+
+doctor_check_verification() {
+  local adapters_file id display mode global_dir _project_dir cli_command app_name verification found=0
+  adapters_file="$(resolve_adapters_file)"
+  [ -f "$adapters_file" ] || return 0
+  while IFS=';' read -r id display mode global_dir _project_dir cli_command app_name verification; do
+    [ -n "$id" ] || continue
+    case "$id" in \#*) continue ;; esac
+    if [ "$verification" = "unverified" ]; then
+      found=1
+      doctor_report warn "${display}（${id}）的 verification 字段字面为 unverified，tools connect 会被拦截" \
+        "确认已完成人工核实后加 --allow-unverified 执行 tools connect $id"
+    fi
+  done < <(tr '\t' ';' < "$adapters_file")
+  [ "$found" -eq 1 ] || doctor_report ok "verification：当前没有适配器被标记为 unverified（此项检查是为将来新增适配器保留的，目前基本不会触发）"
+}
+
+doctor_check_manual_list() {
+  local ids id entry relative_path status link id2 profiles found=0
+  ids="$(read_manual_ids)"
+  if [ -n "$ids" ]; then
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      entry="$(catalog_entry "$id")"
+      if [ -z "$entry" ]; then
+        found=1
+        doctor_report warn "manual.list 记录了未登记的 Skill：$id" \
+          "确认是否还需要，若不需要手动从 $SKILL_LIBRARY_ROOT/state/manual.list 删除该行"
+        continue
+      fi
+      relative_path="${entry%%"$(printf '	')"*}"
+      status="$(link_status "$GLOBAL_SKILLS_DIR/$id" "$relative_path")"
+      if [ "$status" != "已激活" ]; then
+        found=1
+        doctor_report warn "manual.list 记录了 ${id}，但 $GLOBAL_SKILLS_DIR 下没有对应的受管软链（当前状态：${status:-缺失}）" \
+          "如仍需要：skillctl activate $id --apply 重建；如不再需要：skillctl deactivate $id --apply 会一并清理 manual.list 记录"
+      fi
+    done <<< "$ids"
+  fi
+
+  if [ -d "$GLOBAL_SKILLS_DIR" ] && [ ! -L "$GLOBAL_SKILLS_DIR" ]; then
+    for link in "$GLOBAL_SKILLS_DIR"/*; do
+      [ -L "$link" ] && [ -e "$link" ] || continue
+      # 只关心归属仓库的软链——用户自己手动指到仓库以外内容的软链（比如
+      # 直接建到别的目录）不归 skillctl 管，不该被建议 activate/deactivate。
+      eject_link_is_repo_managed "$link" || continue
+      id2="$(basename "$link")"
+      printf '%s\n' "$ids" | grep -F -x "$id2" >/dev/null 2>&1 && continue
+      profiles="$(collect_profiles_for_id "$id2")"
+      [ -n "$profiles" ] && continue
+      found=1
+      doctor_report warn "$id2 在 $GLOBAL_SKILLS_DIR 下有受管软链，但既不属于任何场景包，也没记录在 manual.list 里" \
+        "如需保留：skillctl activate $id2 --apply 补登记进 manual.list；如不需要：skillctl deactivate $id2 --apply"
+    done
+  fi
+
+  [ "$found" -eq 1 ] || doctor_report ok "manual.list 与磁盘软链状态一致"
+}
+
+doctor_check_skill_files() {
+  local dir id name desc found=0
+  [ -d "$SKILL_LIBRARY_ROOT/skills" ] || {
+    doctor_report warn "仓库 skills/ 目录不存在：$SKILL_LIBRARY_ROOT/skills" "确认 SKILL_LIBRARY_ROOT 是否正确：$SKILL_LIBRARY_ROOT"
+    return 0
+  }
+  for dir in "$SKILL_LIBRARY_ROOT/skills"/*; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    id="$(basename "$dir")"
+    case "$id" in .staging-*) continue ;; esac
+    if [ ! -f "$dir/SKILL.md" ]; then
+      found=1
+      doctor_report fail "$id 缺少 SKILL.md" "补全 $dir/SKILL.md（需要 YAML frontmatter，含 name/description 字段）"
+      continue
+    fi
+    name="$(skill_declared_name "$dir" 2>/dev/null || true)"
+    desc="$(skill_description "$dir" 2>/dev/null || true)"
+    if [ -z "$name" ]; then
+      found=1
+      doctor_report fail "$id 的 SKILL.md frontmatter 缺少合法 name 字段" "编辑 $dir/SKILL.md，在 frontmatter 里补上 name: $id"
+    fi
+    if [ -z "$desc" ]; then
+      found=1
+      doctor_report fail "$id 的 SKILL.md frontmatter 缺少 description 字段" "编辑 $dir/SKILL.md，在 frontmatter 里补上 description 字段"
+    fi
+  done
+  [ "$found" -eq 1 ] || doctor_report ok "仓库内所有 Skill 的 SKILL.md frontmatter 都齐全（name/description）"
+}
+
+doctor_check_duplicate_ids() {
+  local dupes id
+  dupes="$(awk -F '\t' 'NF == 8 { print $1 }' "$CATALOG_FILE" | LC_ALL=C sort | uniq -d)"
+  if [ -n "$dupes" ]; then
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      doctor_report fail "catalog 中 id 重复：$id" \
+        "检查是否有两个 Skill 目录的 SKILL.md 声明了相同的 name 字段，改成唯一值后重跑 build-catalog.sh --apply（或任意 import/archive/restore 会自动重建）"
+    done <<< "$dupes"
+  else
+    doctor_report ok "catalog 中没有重复的 Skill id"
+  fi
+}
+
+doctor_check_catalog_disk_consistency() {
+  local found=0 id relative_path dir
+  while IFS="$(printf '\t')" read -r id relative_path _display _aliases _category _triggers _excludes _description; do
+    [ -n "$id" ] || continue
+    if [ ! -d "$SKILL_LIBRARY_ROOT/$relative_path" ]; then
+      found=1
+      doctor_report fail "catalog 记录了 ${id}，但仓库目录不存在：$SKILL_LIBRARY_ROOT/$relative_path" \
+        "运行 build-catalog.sh --apply 重建目录（或执行任意 import/archive/restore 会自动刷新）"
+    fi
+  done < "$CATALOG_FILE"
+
+  if [ -d "$SKILL_LIBRARY_ROOT/skills" ]; then
+    for dir in "$SKILL_LIBRARY_ROOT/skills"/*; do
+      [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+      id="$(basename "$dir")"
+      case "$id" in .staging-*) continue ;; esac
+      if ! awk -F '\t' -v id="$id" 'NF == 8 && $1 == id { f = 1 } END { exit !f }' "$CATALOG_FILE"; then
+        found=1
+        doctor_report fail "仓库里有 ${id}，但 catalog 中没有记录" "运行 build-catalog.sh --apply 重建目录"
+      fi
+    done
+  fi
+  [ "$found" -eq 1 ] || doctor_report ok "catalog 与仓库磁盘内容一致"
+}
+
+cmd_doctor() {
+  DOCTOR_OK=0
+  DOCTOR_WARN=0
+  DOCTOR_FAIL=0
+
+  printf '== 软链健康检查 ==\n'
+  doctor_check_broken_links
+
+  printf '\n== 货架未收编内容 ==\n'
+  doctor_check_shelf_orphans
+
+  printf '\n== 工具检测 ==\n'
+  doctor_check_tools
+
+  printf '\n== verification 检查 ==\n'
+  doctor_check_verification
+
+  printf '\n== manual.list 一致性 ==\n'
+  doctor_check_manual_list
+
+  printf '\n== Skill 内容完整性 ==\n'
+  doctor_check_skill_files
+
+  printf '\n== catalog 重复 id ==\n'
+  doctor_check_duplicate_ids
+
+  printf '\n== catalog 与磁盘一致性 ==\n'
+  doctor_check_catalog_disk_consistency
+
+  printf '\n== 汇总 ==\n'
+  printf '✅ %s  ⚠️ %s  ❌ %s\n' "$DOCTOR_OK" "$DOCTOR_WARN" "$DOCTOR_FAIL"
+  [ "$DOCTOR_FAIL" -eq 0 ]
+}
+
+lint_report() {
+  local level="$1" message="$2" fix="${3:-}"
+  case "$level" in
+    ok)
+      LINT_OK=$((LINT_OK + 1))
+      printf '✅ %s\n' "$message"
+      ;;
+    warn)
+      LINT_WARN=$((LINT_WARN + 1))
+      printf '⚠️ %s\n' "$message"
+      [ -z "$fix" ] || printf '   → %s\n' "$fix"
+      ;;
+    fail)
+      LINT_FAIL=$((LINT_FAIL + 1))
+      printf '❌ %s\n' "$message"
+      [ -z "$fix" ] || printf '   → %s\n' "$fix"
+      ;;
+  esac
+}
+
+# doctor 也检查 SKILL.md 是否存在、name/description 是否齐全（那是仓库
+# 健康检查的一部分），lint 在此基础上多查一条 doctor 不管的：frontmatter
+# 声明的 name 是否跟目录名一致——两者读同一份数据，各自独立判断，允许有
+# 交集，不是谁包含谁。
+lint_check_frontmatter() {
+  local dir id declared_name desc found=0
+  [ -d "$SKILL_LIBRARY_ROOT/skills" ] || {
+    lint_report fail "仓库 skills/ 目录不存在：$SKILL_LIBRARY_ROOT/skills" "确认 SKILL_LIBRARY_ROOT 是否正确：$SKILL_LIBRARY_ROOT"
+    return 0
+  }
+  for dir in "$SKILL_LIBRARY_ROOT/skills"/*; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    id="$(basename "$dir")"
+    case "$id" in .staging-*) continue ;; esac
+    if [ ! -f "$dir/SKILL.md" ]; then
+      found=1
+      lint_report fail "$id 缺少 SKILL.md" "补全 $dir/SKILL.md（需要 YAML frontmatter，含 name/description 字段）"
+      continue
+    fi
+    declared_name="$(skill_declared_name "$dir" 2>/dev/null || true)"
+    desc="$(skill_description "$dir" 2>/dev/null || true)"
+    if [ -z "$declared_name" ]; then
+      found=1
+      lint_report fail "$id 的 SKILL.md frontmatter 缺少合法 name 字段" "编辑 $dir/SKILL.md，补上 name: $id"
+    elif [ "$declared_name" != "$id" ]; then
+      found=1
+      lint_report warn "$id 的 SKILL.md name 字段（${declared_name}）跟目录名不一致" "改 $dir/SKILL.md 的 name: 字段为 ${id}，或者重命名目录以保持一致"
+    fi
+    if [ -z "$desc" ]; then
+      found=1
+      lint_report fail "$id 的 SKILL.md frontmatter 缺少 description 字段" "编辑 $dir/SKILL.md，补上 description 字段"
+    fi
+  done
+  [ "$found" -eq 1 ] || lint_report ok "仓库内所有 Skill 的 frontmatter 完整，且 name 字段与目录名一致"
+}
+
+# 阈值取自真实仓库数据的分布，用 bash 的 ${#desc}（真正参与比较的字符数）
+# 量的，不是 awk length()（那个数的是字节数，中文按 UTF-8 三字节算，会把
+# 阈值撑大三倍——校准时踩过这个坑）：87 个 Skill 实际是 18~802 字，中位数
+# 193。下限 15 明显低于当前最短的 18（lark-attendance/debug-pro 这类范围
+# 很窄的 Skill 天然就短，不该被当噪音报），上限 1000 明显高于当前最长的
+# 802，两头都留了余量，不会在现有内容上报警，只在真正偏离的新增内容上生效。
+lint_check_description_length() {
+  local dir id desc len found=0
+  [ -d "$SKILL_LIBRARY_ROOT/skills" ] || return 0
+  for dir in "$SKILL_LIBRARY_ROOT/skills"/*; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    id="$(basename "$dir")"
+    case "$id" in .staging-*) continue ;; esac
+    [ -f "$dir/SKILL.md" ] || continue
+    desc="$(skill_description "$dir" 2>/dev/null || true)"
+    [ -n "$desc" ] || continue
+    len="${#desc}"
+    if [ "$len" -lt 15 ]; then
+      found=1
+      lint_report warn "$id 的 description 只有 $len 字，信息量可能不够，容易被路由/搜索漏选" "补充触发场景和典型用户表达，参考仓库里其他 Skill 的写法"
+    elif [ "$len" -gt 1000 ]; then
+      found=1
+      lint_report warn "$id 的 description 有 $len 字，偏长" "考虑精简，只保留核心触发场景描述"
+    fi
+  done
+  [ "$found" -eq 1 ] || lint_report ok "所有 Skill 的 description 长度都在合理范围（15~1000 字）"
+}
+
+# 只在"当前激活集合"内部两两比较 triggers 列（catalog.tsv 第 6 列，逗号
+# 分隔）——比较全部 87 个会对着完全不会同时出现在候选池里的 Skill 报噪音；
+# 只比较真正会被同时看到的这批，才是路由歧义会不会实际发生的问题。
+# O(n^2) 的两两比较放在一个 awk 进程里做，避免对 39 个 Skill 就要跑 700+
+# 次子进程的开销。
+lint_check_trigger_overlap() {
+  local link id entry ids_file overlap_output found=0
+  local -a active_ids=()
+
+  if [ ! -d "$GLOBAL_SKILLS_DIR" ] || [ -L "$GLOBAL_SKILLS_DIR" ]; then
+    lint_report ok "触发词重叠：当前没有激活的 Skill，跳过"
+    return 0
+  fi
+  for link in "$GLOBAL_SKILLS_DIR"/*; do
+    [ -L "$link" ] && [ -e "$link" ] || continue
+    id="$(basename "$link")"
+    entry="$(catalog_entry "$id")"
+    [ -n "$entry" ] || continue
+    active_ids+=("$id")
+  done
+
+  if [ "${#active_ids[@]}" -lt 2 ]; then
+    lint_report ok "触发词重叠：激活的 Skill 不足两个，跳过"
+    return 0
+  fi
+
+  ids_file="$(mktemp "${TMPDIR:-/tmp}/skillctl-lint-active.XXXXXX")" || {
+    lint_report fail "无法创建临时文件，跳过触发词重叠检查" "重试，或检查 \$TMPDIR 是否可写"
+    return 0
+  }
+  printf '%s\n' "${active_ids[@]}" > "$ids_file"
+
+  overlap_output="$(awk -F '\t' -v ids_file="$ids_file" '
+    BEGIN {
+      while ((getline line < ids_file) > 0) {
+        if (line != "") wanted[line] = 1
+      }
+      close(ids_file)
+    }
+    NF == 8 && ($1 in wanted) {
+      order[++n] = $1
+      triggers[$1] = $6
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        id_a = order[i]
+        split(triggers[id_a], words_a, ",")
+        delete set_a
+        for (w = 1; w in words_a; w++) if (words_a[w] != "") set_a[words_a[w]] = 1
+        for (j = i + 1; j <= n; j++) {
+          id_b = order[j]
+          split(triggers[id_b], words_b, ",")
+          shared = ""
+          shared_count = 0
+          for (w = 1; w in words_b; w++) {
+            if (words_b[w] != "" && (words_b[w] in set_a)) {
+              shared_count++
+              shared = (shared == "" ? words_b[w] : shared "," words_b[w])
+            }
+          }
+          if (shared_count >= 2) print id_a "\t" id_b "\t" shared
+        }
+      }
+    }
+  ' "$CATALOG_FILE")"
+  rm -f "$ids_file"
+
+  if [ -n "$overlap_output" ]; then
+    found=1
+    while IFS="$(printf '\t')" read -r id_a id_b shared; do
+      [ -n "$id_a" ] || continue
+      lint_report warn "$id_a 和 $id_b 在当前激活集合内触发词重叠较多：$(printf '%s' "$shared" | tr ',' '、')" \
+        "确认这两个 Skill 的边界是否清楚，必要时精简/差异化触发词"
+    done <<< "$overlap_output"
+  fi
+  [ "$found" -eq 1 ] || lint_report ok "当前激活集合内没有明显的触发词重叠"
+}
+
+cmd_lint() {
+  LINT_OK=0
+  LINT_WARN=0
+  LINT_FAIL=0
+
+  printf '== frontmatter 完整性 ==\n'
+  lint_check_frontmatter
+
+  printf '\n== description 长度 ==\n'
+  lint_check_description_length
+
+  printf '\n== 激活集合内触发词重叠度 ==\n'
+  lint_check_trigger_overlap
+
+  printf '\n== 汇总 ==\n'
+  printf '✅ %s  ⚠️ %s  ❌ %s\n' "$LINT_OK" "$LINT_WARN" "$LINT_FAIL"
+  [ "$LINT_FAIL" -eq 0 ]
+}
+
+# 改变了激活/连接状态的 --apply 命令收尾时调用，让本地面板不至于长期是
+# 陈旧快照。面板重建失败不应该让主命令本身报失败（激活/连接已经成功了），
+# 所以这里只警告、不改变调用方的退出码。
+auto_rebuild_dashboard() {
+  if cmd_dashboard_build "yes" >/dev/null 2>&1; then
+    printf '（已自动重建本地面板）\n'
+  else
+    printf '警告：自动重建面板失败，可手动运行 skillctl dashboard build --apply\n' >&2
+  fi
+}
+
+# 出错时打印一句具体的下一步建议（而不是整段命令参考），再指向 skillctl
+# help 看完整参考。每个命令自己的用法错误都在调用处给出针对该命令的提示。
+usage_error() {
+  printf '%s\n' "$1" >&2
+  printf '完整命令参考：skillctl help\n' >&2
+  exit 2
+}
+
+# 不带参数运行 skillctl 时的场景式速查——按"想做什么"而不是命令字母序组织，
+# 控制在一屏以内（约 20 行），要看完整参数说明去查 usage()/skillctl help。
+scene_help() {
+  cat <<'EOF'
+skillctl —— 多工具共用的 Skill 仓库管理
+
+常用场景：
+  skillctl status —— 看现状：每个 Skill 的激活/归档/冲突状态
+  skillctl profile use <场景包名> --apply —— 切场景包（core/aipm/frameflow/stock/lark）
+  skillctl activate <id> --apply —— 激活一个 Skill
+  skillctl deactivate <id> --apply —— 停用一个 Skill
+  skillctl import <绝对目录> --apply —— 把仓库外的 Skill 收进仓库
+  skillctl archive <id> --apply —— 下架（软删除，能用 restore 恢复）
+  skillctl tools detect —— 看哪些工具已装/已连接
+  skillctl tools connect <工具id> --apply —— 把当前激活集合同步给某个工具
+  skillctl doctor —— 体检：断链/工具检测/一致性等，只读
+  skillctl lint —— 检查 Skill 内容质量：frontmatter/description 长度/触发词重叠，只读
+  skillctl dashboard build --apply && skillctl dashboard open —— 生成并打开本地只读面板
+  skillctl eject --apply —— 彻底退出这套软链管理（不可逆，先看预演）
+
+其他：skillctl list ・ search <关键词> ・ restore <id> --apply
+所有会改状态的命令都默认只预演，不带 --apply 不会真正执行；完整参数说明：skillctl help
+EOF
+}
+
+# 完整命令参考，skillctl help/-h/--help 时展示；route/route-status/project
+# 属于实验性功能（route 的自动选择还没达标启用，project 用得很少），行为和
+# 参数完全不变，只是不出现在上面的场景速查里，也单独归了一类，别当成新增
+# 功能去测——代码和既有测试没动。
+usage() {
+  cat <<'EOF'
+skillctl —— 多工具共用的 Skill 仓库管理
+
+只读查询：
+  skillctl list
+  skillctl search <关键词>
+  skillctl status
+  skillctl tools detect
+  skillctl dashboard open
+  skillctl doctor
+  skillctl lint
+  skillctl export <id> [--output <绝对路径>]        打包成干净拷贝，默认输出到 ~/Desktop/skill-export-<id>/
+
+会改动状态的命令（默认只预演，加 --apply 才真正执行）：
+  skillctl activate <id> [--apply]
+  skillctl deactivate <id> [--apply]
+  skillctl profile use <场景包名> [--apply]
+  skillctl import <绝对目录> [--display-name 名称] [--alias 名称] [--activate] [--replace] [--apply]
+  skillctl archive <id> [--apply]
+  skillctl restore <id> [--archive-id 归档ID] [--reactivate] [--apply]
+  skillctl tools connect <工具id> [--allow-unverified] [--prune] [--apply]
+  skillctl tools disconnect <工具id> [--apply]
+  skillctl dashboard build [--apply]
+  skillctl eject [--apply]        彻底退出这套软链管理，不可逆
+
+实验性（行为不变，代码保留，不进常用场景速查）：
+  skillctl route <一句话描述>                      同 skillctl experimental route
+  skillctl route-status                          同 skillctl experimental route-status
+  skillctl project use <场景包名> <绝对项目路径> [--apply]   同 skillctl experimental project use ...
+
+不带参数运行 skillctl 可以看场景式速查。
+EOF
+}
+
+[ "$#" -gt 0 ] || {
+  scene_help
+  exit 0
+}
+
+command="$1"
+shift
+case "$command" in
+  list)
+    [ "$#" -eq 0 ] || usage_error "list 不接受参数；想按关键词筛选用 skillctl search <关键词>"
+    require_catalog
+    list_catalog
+    ;;
+  search)
+    [ "$#" -gt 0 ] || usage_error "用法：skillctl search <关键词>，例如 skillctl search 飞书"
+    require_catalog
+    search_catalog "$*"
+    ;;
+  route|project|experimental)
+    case "$command" in
+      experimental)
+        [ "$#" -ge 1 ] || usage_error "用法：skillctl experimental {route <文本>|route-status|project use <场景包名> <绝对项目路径> [--apply]}"
+        exp_sub="$1"
+        shift
+        ;;
+      route) exp_sub="route" ;;
+      project) exp_sub="project" ;;
+    esac
+    case "$exp_sub" in
+      route)
+        [ "$#" -gt 0 ] || usage_error "用法：skillctl experimental route <一句话描述>，例如 skillctl experimental route \"帮我拆一下这个产品\""
+        require_catalog
+        route_candidates "$*"
+        ;;
+      route-status)
+        [ "$#" -eq 0 ] || usage_error "route-status 不接受参数"
+        require_catalog
+        print_route_status
+        ;;
+      project)
+        [ "$#" -eq 3 ] || [ "$#" -eq 4 ] || usage_error "用法：skillctl experimental project use <场景包名> <绝对项目路径> [--apply]"
+        [ "$1" = "use" ] || usage_error "用法：skillctl experimental project use <场景包名> <绝对项目路径> [--apply]"
+        profile_name="$2"
+        project_path="$3"
+        apply="no"
+        if [ "$#" -eq 4 ]; then
+          [ "$4" = "--apply" ] || usage_error "未知参数：$4；project use 只接受结尾的 --apply"
+          apply="yes"
+        fi
+        require_catalog
+        project_path="$(require_project_directory "$project_path")" || exit 2
+        replace_profile_links "$project_path/.agents/skills" "$profile_name" "$apply"
+        ;;
+      *) usage_error "未知的 experimental 子命令：${exp_sub}；支持 route/route-status/project" ;;
+    esac
+    ;;
+  status)
+    [ "$#" -eq 0 ] || usage_error "status 不接受参数"
+    require_catalog
+    print_status
+    ;;
+  route-status)
+    [ "$#" -eq 0 ] || usage_error "route-status 不接受参数"
+    require_catalog
+    print_route_status
+    ;;
+  activate)
+    [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || usage_error "用法：skillctl activate <id> [--apply]；不知道 id 就先 skillctl search <关键词> 确认"
+    id="$1"
+    apply="no"
+    if [ "$#" -eq 2 ]; then
+      [ "$2" = "--apply" ] || usage_error "未知参数：$2；activate 只接受结尾的 --apply"
+      apply="yes"
+    fi
+    require_catalog
+    APPLY_LINK_STATUS="skipped"
+    apply_link_for_id "$GLOBAL_SKILLS_DIR" "$id" "$apply"
+    if [ "$apply" = "yes" ] && [ "$APPLY_LINK_STATUS" = "managed" ]; then
+      manual_list_add "$id"
+      auto_rebuild_dashboard
+    fi
+    ;;
+  deactivate)
+    [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || usage_error "用法：skillctl deactivate <id> [--apply]；不知道 id 就先 skillctl status 看当前激活了什么"
+    id="$1"
+    apply="no"
+    if [ "$#" -eq 2 ]; then
+      [ "$2" = "--apply" ] || usage_error "未知参数：$2；deactivate 只接受结尾的 --apply"
+      apply="yes"
+    fi
+    require_catalog
+    deactivate_id "$GLOBAL_SKILLS_DIR" "$id" "$apply"
+    if [ "$apply" = "yes" ]; then
+      manual_list_remove "$id"
+      # 只在目标路径本身没有祖先软链这类安全隐患时才自动重建面板——那种
+      # 情况下 deactivate_id 已经安全跳过、什么都没动，重建面板会凭空写出
+      # 一个新文件，破坏"整棵树纹丝不动"这条既有安全测试断言的前提。
+      if safe_link_directory "$GLOBAL_SKILLS_DIR" >/dev/null 2>&1; then
+        auto_rebuild_dashboard
+      fi
+    fi
+    ;;
+  profile)
+    [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || usage_error "用法：skillctl profile use <场景包名> [--apply]；场景包名如 core/aipm/frameflow/stock/lark"
+    [ "$1" = "use" ] || usage_error "用法：skillctl profile use <场景包名> [--apply]"
+    profile_name="$2"
+    apply="no"
+    if [ "$#" -eq 3 ]; then
+      [ "$3" = "--apply" ] || usage_error "未知参数：$3；profile use 只接受结尾的 --apply"
+      apply="yes"
+    fi
+    require_catalog
+    replace_profile_links "$GLOBAL_SKILLS_DIR" "$profile_name" "$apply"
+    if [ "$apply" = "yes" ] && safe_link_directory "$GLOBAL_SKILLS_DIR" >/dev/null 2>&1; then
+      auto_rebuild_dashboard
+    fi
+    ;;
+  import)
+    [ "$#" -ge 1 ] || usage_error "用法：skillctl import <绝对目录> [--display-name 名称] [--alias 名称] [--activate] [--replace] [--apply]"
+    # 故意不在这里 require_catalog：import 是唯一允许在全新安装、
+    # catalog.tsv 还不存在时运行的命令（它是"从零开始建仓库"的入口）。
+    # cmd_import 自己不读 catalog.tsv，最后靠 rebuild_catalog_or_warn 把它
+    # 建出来；真实发现：install-manager.sh --apply 之后、第一次 import 之前，
+    # ~/.skill-library 下既没有 skills/ 也没有 catalog.tsv，这是刻意的
+    # 设计边界（装机脚本从不碰这几个目录），import 得能在这个状态下跑通，
+    # 不然干净账户走一遍 Quickstart 第一步就卡死。
+    cmd_import "$@"
+    ;;
+  export)
+    [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || usage_error "用法：skillctl export <id> [--output <绝对路径>]；不知道 id 就先 skillctl status 或 skillctl search <关键词>"
+    id="$1"
+    output=""
+    if [ "$#" -eq 3 ]; then
+      [ "$2" = "--output" ] || usage_error "未知参数：$2；export 只接受 --output <绝对路径>"
+      output="$3"
+    fi
+    require_catalog
+    cmd_export "$id" "$output"
+    ;;
+  archive)
+    [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || usage_error "用法：skillctl archive <id> [--apply]；不知道 id 就先 skillctl status 看当前有哪些"
+    id="$1"
+    apply="no"
+    if [ "$#" -eq 2 ]; then
+      [ "$2" = "--apply" ] || usage_error "未知参数：$2；archive 只接受结尾的 --apply"
+      apply="yes"
+    fi
+    require_catalog
+    cmd_archive "$id" "$apply"
+    ;;
+  restore)
+    [ "$#" -ge 1 ] || usage_error "用法：skillctl restore <id> [--archive-id 归档ID] [--reactivate] [--apply]"
+    id="$1"
+    shift
+    restore_archive_id=""
+    reactivate="no"
+    apply="no"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --archive-id)
+          [ "$#" -ge 2 ] || usage_error "--archive-id 后面需要跟归档 ID（形如 20260814-124500-ab12cd34）"
+          restore_archive_id="$2"
+          shift 2
+          ;;
+        --reactivate) reactivate="yes"; shift ;;
+        --apply) apply="yes"; shift ;;
+        *) usage_error "未知参数：$1；restore 支持 --archive-id/--reactivate/--apply" ;;
+      esac
+    done
+    require_catalog
+    cmd_restore "$id" "$restore_archive_id" "$reactivate" "$apply"
+    ;;
+  tools)
+    [ "$#" -ge 1 ] || usage_error "用法：skillctl tools {detect|connect <工具id> [--apply]|disconnect <工具id> [--apply]}"
+    tools_sub="$1"
+    shift
+    case "$tools_sub" in
+      detect)
+        [ "$#" -eq 0 ] || usage_error "tools detect 不接受参数"
+        cmd_tools_detect
+        ;;
+      connect)
+        [ "$#" -ge 1 ] || usage_error "用法：skillctl tools connect <工具id> [--allow-unverified] [--prune] [--apply]；不知道工具 id 就先 skillctl tools detect"
+        id="$1"
+        shift
+        apply="no"
+        allow_unverified="no"
+        prune="no"
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --apply) apply="yes"; shift ;;
+            --allow-unverified) allow_unverified="yes"; shift ;;
+            --prune) prune="yes"; shift ;;
+            *) usage_error "未知参数：$1；tools connect 支持 --allow-unverified/--prune/--apply" ;;
+          esac
+        done
+        cmd_tools_connect "$id" "$apply" "$allow_unverified" "$prune"
+        if [ "$apply" = "yes" ]; then
+          auto_rebuild_dashboard
+        fi
+        ;;
+      disconnect)
+        [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || usage_error "用法：skillctl tools disconnect <工具id> [--apply]；不知道工具 id 就先 skillctl tools detect"
+        id="$1"
+        apply="no"
+        if [ "$#" -eq 2 ]; then
+          [ "$2" = "--apply" ] || usage_error "未知参数：$2；tools disconnect 只接受结尾的 --apply"
+          apply="yes"
+        fi
+        cmd_tools_disconnect "$id" "$apply"
+        if [ "$apply" = "yes" ]; then
+          auto_rebuild_dashboard
+        fi
+        ;;
+      *) usage_error "未知的 tools 子命令：${tools_sub}；支持 detect/connect/disconnect" ;;
+    esac
+    ;;
+  dashboard)
+    [ "$#" -ge 1 ] || usage_error "用法：skillctl dashboard {build [--apply]|open}"
+    dashboard_sub="$1"
+    shift
+    case "$dashboard_sub" in
+      build)
+        [ "$#" -eq 0 ] || [ "$#" -eq 1 ] || usage_error "用法：skillctl dashboard build [--apply]"
+        apply="no"
+        if [ "$#" -eq 1 ]; then
+          [ "$1" = "--apply" ] || usage_error "未知参数：$1；dashboard build 只接受结尾的 --apply"
+          apply="yes"
+        fi
+        cmd_dashboard_build "$apply"
+        ;;
+      open)
+        [ "$#" -eq 0 ] || usage_error "dashboard open 不接受参数"
+        cmd_dashboard_open
+        ;;
+      *) usage_error "未知的 dashboard 子命令：${dashboard_sub}；支持 build/open" ;;
+    esac
+    ;;
+  eject)
+    [ "$#" -eq 0 ] || [ "$#" -eq 1 ] || usage_error "用法：skillctl eject [--apply]"
+    apply="no"
+    if [ "$#" -eq 1 ]; then
+      [ "$1" = "--apply" ] || usage_error "未知参数：$1；eject 只接受结尾的 --apply"
+      apply="yes"
+    fi
+    cmd_eject "$apply"
+    if [ "$apply" = "yes" ]; then
+      auto_rebuild_dashboard
+    fi
+    ;;
+  doctor)
+    [ "$#" -eq 0 ] || usage_error "doctor 不接受参数"
+    require_catalog
+    cmd_doctor
+    ;;
+  lint)
+    [ "$#" -eq 0 ] || usage_error "lint 不接受参数"
+    require_catalog
+    cmd_lint
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage_error "未知命令：${command}；不带参数运行 skillctl 看常用场景，或 skillctl help 看完整命令"
+    ;;
+esac

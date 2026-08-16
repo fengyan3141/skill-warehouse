@@ -1,0 +1,5 @@
+# core 场景包永远保留（profile use 切换任何场景包都不会清掉这里的成员）。
+# 这里只放了随包附带的两个示例 Skill；换成你自己的仓库后，把你希望"始终
+# 激活"的 Skill id 放进来，一行一个。
+commit-message-writer
+code-review-checklist

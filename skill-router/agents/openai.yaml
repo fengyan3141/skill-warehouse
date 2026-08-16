@@ -1,0 +1,2 @@
+display_name: 技能调度器
+short_description: 在已安装的 Skill 之间做低上下文路由，找不到明确匹配时用中文名称向用户确认

@@ -1,0 +1,7 @@
+# install-manager.sh 用这份清单校验场景包（config/profiles/*）里引用的
+# Skill id 是不是都"预期存在"——纯粹是打包时的一致性检查，不是运行时读取
+# 的文件。列出随包附带的示例 Skill 和配套的路由器 Skill；你自己新增/删减
+# Skill 后，保持这份清单和 config/profiles/ 下的引用一致即可。
+commit-message-writer
+code-review-checklist
+skill-router

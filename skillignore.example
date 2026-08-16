@@ -1,0 +1,24 @@
+# ~/.agents/.skillignore
+#
+# 这里只控制 sync-skills.sh 给以下六个目录创建的软链：
+# .claude / .trae / .kiro / .codebuddy / .qoder / .openclaw
+#
+# 重要：Codex、Cursor、Gemini CLI 会直接读取 ~/.agents/skills。
+# 因此，这个文件不能让某个 skill 从这三个工具中消失；需要在对应工具中单独禁用，
+# 或把该 skill 改为项目级 skill。
+#
+# 一行一个：
+#   skill-name
+#       不向上述六个软链目标分发。
+#   skill-name @.trae/skills
+#       只是不向 Trae 分发。
+
+# 示例：交易 skill 不给 Trae
+# xiaosheng-trader @.trae/skills
+
+# 示例：飞书 skill 不给 Kiro、Trae
+# lark-base @.kiro/skills
+# lark-base @.trae/skills
+
+# 不建议在这里写 notebooklm 来表达“只给 Claude”。
+# 因为它仍位于 ~/.agents/skills，Codex、Cursor、Gemini CLI 依然能发现它。

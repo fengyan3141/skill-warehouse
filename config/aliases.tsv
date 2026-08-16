@@ -1,0 +1,4 @@
+# id	display_zh	aliases_zh	category	triggers	excludes
+commit-message-writer	提交信息生成	commit message,写提交信息	dev	commit,提交信息,git commit	代码审查
+code-review-checklist	代码审查清单	code review,审查代码	dev	代码审查,review,PR 审查	写提交信息
+skill-router	技能调度器	技能路由,查找技能,选择技能	system	技能,路由,调度	
