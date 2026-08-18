@@ -538,7 +538,13 @@ generate_dashboard() {
     content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
     background: var(--primary); margin-right: 8px; vertical-align: middle;
   }
-  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  /* 筛选/视图控件（搜索、状态、分类、分组开关）和操作类按钮（三种模式 +
+     导入/同步）拆成两行——控件数量从 6 个涨到现在的更多个之后，挤在同一行
+     里，宽度不够时 .controls-secondary 那个"贴右侧+左边框分隔线"的悬浮块
+     会单独换到第二行、跟上面断开，看着像凭空多出来的一截。拆成两个独立的
+     flex 行之后，每一行各自换行，不会再出现这种视觉上无依无靠的悬浮块。 */
+  .controls { display: flex; flex-direction: column; gap: 14px; margin-bottom: 20px; }
+  .controls-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   .search-field { position: relative; display: inline-flex; align-items: center; }
   .search-field::before {
     content: "⌕"; position: absolute; left: 11px; font-size: 13px; color: var(--text-muted); pointer-events: none;
@@ -548,7 +554,7 @@ generate_dashboard() {
     background: var(--surface-2); color: var(--text); font-size: 0.85rem; width: 260px;
   }
   select {
-    padding: 6px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong);
+    padding: 7px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong);
     background: var(--surface-2); color: var(--text); font-size: 0.85rem; font-weight: 600;
   }
   input[type=search]:focus, select:focus, button:focus-visible {
@@ -583,7 +589,7 @@ generate_dashboard() {
   button.copy-btn:hover { background: var(--surface-2); border-color: var(--primary); }
   tr.hidden { display: none; }
   button.mode-toggle-btn {
-    font-size: 0.78rem; font-weight: 600; padding: 5px 11px; cursor: pointer; border-radius: var(--radius-sm);
+    font-size: 0.78rem; font-weight: 600; padding: 7px 15px; cursor: pointer; border-radius: var(--radius-sm);
     border: 1px solid var(--border); background: var(--surface); color: var(--text); transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, filter 0.15s ease;
   }
   /* 三个模式按钮平时就带各自的色调背景（不是只在 hover/active 才有颜色），
@@ -604,7 +610,7 @@ generate_dashboard() {
   /* margin-left: auto 把这一组推到 .controls 这一行的最右侧——跟前面
      "对选中行做操作"那一组隔开，不管窗口多宽，视觉上都固定贴在卡片右
      边，不会随内容宽度巧合地停在中间某个位置。 */
-  .controls-secondary { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-left: auto; padding-left: 12px; border-left: 1px solid var(--border); }
+  .controls-secondary { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-left: auto; padding-left: 16px; border-left: 1px solid var(--border); }
   /* 飞书按 App 类型区分颜色（文档蓝、多维表格紫……），这里借用同一套逻辑：
      导入/同步类动作统一用紫色调，跟"三种模式"的蓝/橙/红明确区分开，同时
      跟仓库列表用的中性灰按钮也不会混在一起看不出来能点。 */
@@ -612,6 +618,17 @@ generate_dashboard() {
     background: var(--accent2-bg); border: 1px solid var(--accent2); color: var(--accent2);
   }
   button.mode-toggle-btn.btn-ghost:hover { filter: brightness(1.12); }
+  /* 视觉上要读成"筛选/视图"的一员（跟旁边的搜索框、状态/分类下拉一个色系），
+     不能用 btn-ghost 的紫色——那个紫色是"导入/同步"这类动作按钮专用的语义色，
+     混进筛选区会让人以为这是另一个动作入口。默认态直接复用 select 的中性配色，
+     选中态借 --primary 表达"这个视图选项当前打开"，跟侧栏高亮同一套逻辑。 */
+  button.filter-toggle-btn {
+    padding: 7px 15px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong);
+    background: var(--surface-2); color: var(--text); font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    transition: filter 0.15s ease, background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  }
+  button.filter-toggle-btn:hover { filter: brightness(1.08); }
+  button.filter-toggle-btn.active { background: var(--primary-bg); border-color: var(--primary); color: var(--primary); }
   button.mode-toggle-btn.btn-primary {
     background: var(--primary); border: 1px solid var(--primary); color: var(--primary-fg); font-weight: 700;
   }
@@ -800,8 +817,18 @@ HTML_HEAD
 
   printf '<section id="skills-section">\n<h2 data-i18n="sectionSkills">Skill 列表</h2>\n'
   printf '<div class="controls">\n'
+  printf '<div class="controls-row">\n'
   printf '<input type="search" id="skill-search" placeholder="按中文名称、别名或英文 ID 搜索…" data-i18n-placeholder="searchPlaceholder" oninput="applyFilters()">\n'
   printf '<select id="status-filter" onchange="applyFilters()"><option value="" data-i18n="filterAll">全部状态</option><option value="已激活" data-i18n="statActive">已激活</option><option value="仓库中" data-i18n="statWarehouse">仓库中</option></select>\n'
+  printf '<select id="category-filter" onchange="applyFilters()"><option value="" data-i18n="filterAllCategory">全部分类</option>'
+  awk -F'\t' 'NF==8 && $5!="" {print $5}' "$CATALOG_FILE" | sort -u | while IFS= read -r cat; do
+    esc="$(html_escape "$cat")"
+    printf '<option value="%s">%s</option>' "$esc" "$esc"
+  done
+  printf '</select>\n'
+  printf '<button type="button" id="group-toggle-btn" class="filter-toggle-btn" data-i18n="btnGroupByCategory" onclick="toggleCategoryGrouping()">按分类分组</button>\n'
+  printf '</div>\n'
+  printf '<div class="controls-row">\n'
   printf '<button type="button" id="activate-mode-btn" class="mode-toggle-btn" data-mode="activate" data-i18n="modeActivate" onclick="toggleSelectionMode(%s)">常驻模式</button>\n' "$(js_string_literal activate)"
   printf '<button type="button" id="deactivate-mode-btn" class="mode-toggle-btn" data-mode="deactivate" data-i18n="modeDeactivate" onclick="toggleSelectionMode(%s)">移入仓库模式</button>\n' "$(js_string_literal deactivate)"
   printf '<button type="button" id="delete-mode-btn" class="mode-toggle-btn" data-mode="delete" data-i18n="modeDelete" onclick="toggleSelectionMode(%s)">删除模式</button>\n' "$(js_string_literal delete)"
@@ -809,6 +836,7 @@ HTML_HEAD
   printf '<button type="button" id="github-import-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnGithubImport" onclick="openGithubWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">从 GitHub 导入</button>\n'
   printf '<button type="button" id="upload-import-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnUploadImport" onclick="openUploadWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">本地拖拽导入</button>\n'
   printf '<button type="button" id="check-updates-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnCheckUpdates" onclick="runCheckUpdates()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">检查更新</button>\n'
+  printf '</div>\n'
   printf '</div>\n'
   printf '</div>\n'
   render_skills_table
@@ -921,16 +949,42 @@ if (LIVE) {
 function applyFilters() {
   var q = (document.getElementById('skill-search').value || '').toLowerCase();
   var wantStatus = document.getElementById('status-filter').value;
+  var wantCategory = document.getElementById('category-filter').value;
   var rows = document.querySelectorAll('#skills-table tbody tr');
   rows.forEach(function (row) {
     var hay = row.dataset.search || '';
     var status = row.dataset.status || '';
+    var category = row.dataset.category || '';
     var matchesText = q === '' || hay.indexOf(q) !== -1;
     var matchesStatus = wantStatus === '' ||
       status === wantStatus ||
       (wantStatus === '冲突' && status.indexOf('冲突') !== -1);
-    row.classList.toggle('hidden', !(matchesText && matchesStatus));
+    var matchesCategory = wantCategory === '' || category === wantCategory;
+    row.classList.toggle('hidden', !(matchesText && matchesStatus && matchesCategory));
   });
+}
+// 默认顺序是 catalog.tsv 的字母序（build 时就是这个顺序，见 render_skills_table），
+// 分类字段本身可以不一样，同分类的行天然是散开的——这个开关只做纯前端重排，不碰
+// 数据也不碰 catalog.tsv，切回默认顺序时按 data-id 重新排一次，不依赖记住原始 DOM
+// 顺序（原始顺序本来就是 data-id 字母序，两者等价）。
+var categoryGrouped = false;
+function toggleCategoryGrouping() {
+  categoryGrouped = !categoryGrouped;
+  var btn = document.getElementById('group-toggle-btn');
+  btn.classList.toggle('active', categoryGrouped);
+  btn.dataset.i18n = categoryGrouped ? 'btnGroupByCategoryOff' : 'btnGroupByCategory';
+  btn.textContent = t(btn.dataset.i18n);
+  var tbody = document.querySelector('#skills-table tbody');
+  var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+  rows.sort(function (a, b) {
+    if (categoryGrouped) {
+      var ca = a.dataset.category || '', cb = b.dataset.category || '';
+      if (ca !== cb) return ca < cb ? -1 : 1;
+    }
+    var ia = a.dataset.id || '', ib = b.dataset.id || '';
+    return ia < ib ? -1 : (ia > ib ? 1 : 0);
+  });
+  rows.forEach(function (row) { tbody.appendChild(row); });
 }
 function copyCommand(btn, text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1270,6 +1324,9 @@ var I18N = {
   sectionAdapters: { zh: '软件接入', en: 'Tools' },
   searchPlaceholder: { zh: '按中文名称、别名或英文 ID 搜索…', en: 'Search by name, alias, or ID…' },
   filterAll: { zh: '全部状态', en: 'All statuses' },
+  filterAllCategory: { zh: '全部分类', en: 'All categories' },
+  btnGroupByCategory: { zh: '按分类分组', en: 'Group by category' },
+  btnGroupByCategoryOff: { zh: '恢复默认顺序', en: 'Default order' },
   modeActivate: { zh: '常驻模式', en: 'Activate Mode' },
   modeDeactivate: { zh: '移入仓库模式', en: 'Deactivate Mode' },
   modeDelete: { zh: '删除模式', en: 'Delete Mode' },
