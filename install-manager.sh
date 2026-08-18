@@ -24,7 +24,7 @@ for arg in "$@"; do
   esac
 done
 
-BIN_FILES=(skillctl build-catalog.sh build-dashboard.sh evaluate-router.sh sync-skills.sh)
+BIN_FILES=(skillctl build-catalog.sh build-dashboard.sh dashboard-server.py evaluate-router.sh sync-skills.sh)
 LIB_FILES=(skill-lib.sh)
 
 if [ "$APPLY" -ne 1 ]; then
@@ -56,16 +56,23 @@ done
 [ -d "$PACKAGE_SOURCE/config" ] || { printf '缺少打包配置目录: config\n' >&2; exit 1; }
 /usr/bin/ditto "$PACKAGE_SOURCE/config" "$staging/config"
 
-# --- Staged validation: bash -n on every shell entrypoint, six-column
-#     aliases, eight-column adapters, and every profile ID present in the
-#     inventory. Nothing below is installed until all of this passes.
+# --- Staged validation: bash -n on every shell entrypoint, a Python syntax
+#     check on dashboard-server.py, six-column aliases, eight-column
+#     adapters, and every profile ID present in the inventory. Nothing
+#     below is installed until all of this passes.
 for entry in "$staging/bin"/* "$staging/lib"/*; do
   [ -f "$entry" ] || continue
   case "$entry" in
-    *.sh|*/skillctl) ;;
-    *) continue ;;
+    *.sh|*/skillctl)
+      bash -n "$entry" || { printf '语法校验失败: %s\n' "$entry" >&2; exit 1; }
+      ;;
+    *.py)
+      command -v python3 >/dev/null 2>&1 && {
+        python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$entry" \
+          || { printf '语法校验失败: %s\n' "$entry" >&2; exit 1; }
+      }
+      ;;
   esac
-  bash -n "$entry" || { printf '语法校验失败: %s\n' "$entry" >&2; exit 1; }
 done
 
 [ -f "$staging/config/aliases.tsv" ] || { printf '缺少 config/aliases.tsv\n' >&2; exit 1; }

@@ -155,7 +155,8 @@ test_invalid_staged_package_rolls_back() {
   broken_package="$TEST_ROOT/broken-package"
   mkdir -p "$broken_package/lib"
   cp "$real_package"/skillctl "$real_package"/build-catalog.sh "$real_package"/build-dashboard.sh \
-    "$real_package"/evaluate-router.sh "$real_package"/sync-skills.sh "$broken_package/"
+    "$real_package"/dashboard-server.py "$real_package"/evaluate-router.sh "$real_package"/sync-skills.sh \
+    "$broken_package/"
   cp "$real_package/lib/skill-lib.sh" "$broken_package/lib/skill-lib.sh"
   cp -R "$real_package/config" "$broken_package/config"
   printf 'if [ then broken shell syntax\n' >> "$broken_package/skillctl"

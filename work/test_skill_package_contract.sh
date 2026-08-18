@@ -69,11 +69,11 @@ fi
 
 if [ -f "$PACKAGE/config/adapters/tools.tsv" ]; then
   adapters="$(awk -F '\t' '$1 !~ /^#/ {print $1}' "$PACKAGE/config/adapters/tools.tsv" | sort)"
-  expected_adapters="$(printf '%s\n' claude-code codebuddy codex cursor gemini-cli kiro qoder trae trae-cn)"
-  assert_eq "$adapters" "$expected_adapters" "软件适配器固定为九个批准工具"
+  expected_adapters="$(printf '%s\n' claude-code codebuddy codex cursor gemini-cli kiro qoder trae trae-cn windsurf)"
+  assert_eq "$adapters" "$expected_adapters" "软件适配器固定为十个批准工具"
   assert_eq "$(awk -F '\t' '$3 == "native" && $4 != "~/.agents/skills" {bad++} END {print bad+0}' "$PACKAGE/config/adapters/tools.tsv")" 0 "原生适配器使用共享全局目录"
 else
-  not_ok "软件适配器固定为九个批准工具"
+  not_ok "软件适配器固定为十个批准工具"
   not_ok "原生适配器使用共享全局目录"
 fi
 
@@ -94,14 +94,15 @@ if [ -f "$PACKAGE/README.md" ]; then
   assert_contains "$readme" "90%" "README 说明 Top1 准确率门槛"
   assert_contains "$readme" "98%" "README 说明 Top3 准确率门槛"
   assert_contains "$readme" "skillctl import" "README 说明导入命令"
-  assert_contains "$readme" "skillctl archive" "README 说明归档命令"
-  assert_contains "$readme" "skillctl restore" "README 说明恢复命令"
+  assert_contains "$readme" "skillctl import-github" "README 说明 GitHub 导入命令"
+  assert_contains "$readme" "skillctl check-updates" "README 说明检查更新命令"
   assert_contains "$readme" "claude-code" "README 提及适配器"
   assert_contains "$readme" "codebuddy" "README 提及适配器"
   assert_contains "$readme" "qoder" "README 提及适配器"
   assert_contains "$readme" "tools detect" "README 说明新软件检测"
-  assert_contains "$readme" "只读面板" "README 说明只读面板"
+  assert_contains "$readme" "本地服务" "README 说明本地服务模式"
   assert_contains "$readme" "dashboard build" "README 给出面板生成命令"
+  assert_contains "$readme" "dashboard serve" "README 给出本地服务启动命令"
   assert_contains "$readme" "完整备份" "README 说明迁移前完整备份"
   assert_contains "$readme" "macOS" "README 声明 macOS only"
   assert_contains "$readme" "skillctl doctor" "README 说明健康检查命令"

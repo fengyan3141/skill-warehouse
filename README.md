@@ -18,7 +18,9 @@
 skillctl status                          # 看现状：哪些 Skill 在仓库、哪些已激活
 skillctl profile use core --apply        # 切到 core 场景包（这个场景包永远保留）
 skillctl tools connect claude-code --apply  # 把当前激活集合同步给 Claude Code
+skillctl import-github <GitHub URL> --activate --apply  # 从 GitHub 仓库直接收编一个 Skill
 skillctl doctor                          # 体检：断链、工具检测、一致性等，只读
+skillctl dashboard serve                 # 起本地面板，浏览器里点按钮直接生效
 skillctl eject --apply                   # 不想用了？把软链换成独立真实拷贝，随时退出
 ```
 
@@ -71,7 +73,7 @@ skillctl profile use core --apply
 skillctl tools detect
 ```
 
-会显示九个已知适配器（见下文）里哪些已检测到。对软链模式的工具（比如 Claude Code）：
+会显示十个已知适配器（见下文）里哪些已检测到。对软链模式的工具（比如 Claude Code）：
 
 ```bash
 skillctl tools connect claude-code --apply
@@ -80,13 +82,13 @@ skillctl tools connect claude-code --apply
 ### 5.（可选）生成本地面板
 
 ```bash
-skillctl dashboard build --apply
-skillctl dashboard open
+skillctl dashboard build --apply && skillctl dashboard open   # 静态快照：按钮把命令复制到剪贴板
+skillctl dashboard serve                                      # 本地服务：按钮点了直接生效
 ```
 
-一个自包含的只读 HTML 页面：顶部统计卡片、Skill 列表、场景包成员、工具接入状态。改变激活/连接状态的命令执行后会自动重建，一般不用手动跑。
+自包含的 HTML 面板：顶部统计卡片、Skill 列表（支持勾选批量操作）、场景包成员、工具接入状态、日间/夜间/跟随系统主题切换。两种模式二选一，细节见后面的[「面板：静态快照 vs 本地服务」](#面板静态快照-vs-本地服务)。改变激活/连接状态的命令执行后会自动重建静态快照，一般不用手动跑 `dashboard build`。
 
-到这里，你已经有一个能用的仓库了。接下来把你自己的 Skill `import` 进来，参考下面「核心概念」理解场景包怎么组织，或者看「接入清单外的工具」把仓库接进一个不在默认九个里的工具。
+到这里，你已经有一个能用的仓库了。接下来把你自己的 Skill `import` 进来，参考下面「核心概念」理解场景包怎么组织，或者看「接入清单外的工具」把仓库接进一个不在默认十个里的工具。
 
 ---
 
@@ -108,9 +110,9 @@ skillctl profile use core --apply
 
 ## 命令参考
 
-只读查询：`list` / `search <关键词>` / `status` / `tools detect` / `dashboard open` / `doctor` / `lint` / `export <id> [--output <绝对路径>]`
+只读查询：`list` / `search <关键词>` / `status` / `tools detect` / `dashboard open` / `doctor` / `lint` / `check-updates [id]` / `export <id> [--output <绝对路径>]`
 
-会改动状态（默认只预演，加 `--apply` 才真正执行）：`activate` / `deactivate` / `profile use` / `import` / `archive` / `restore` / `tools connect` / `tools disconnect` / `dashboard build` / `eject`
+会改动状态（默认只预演，加 `--apply` 才真正执行）：`activate` / `deactivate` / `profile use` / `import` / `import-github` / `track-source` / `tools connect` / `tools disconnect` / `dashboard build` / `eject`
 
 不带参数运行 `skillctl` 看场景式速查，`skillctl help` 看完整参数说明。
 
@@ -118,19 +120,22 @@ skillctl profile use core --apply
 skillctl import /absolute/path/to/skill
 skillctl import /absolute/path/to/skill --activate --apply
 skillctl import /absolute/path/to/new-version --replace --apply
+skillctl import-github https://github.com/owner/repo --activate --apply
+skillctl import-github https://github.com/owner/repo --path skills/some-skill --apply   # 多 Skill 仓库要指定子路径
+skillctl track-source existing-skill-id https://github.com/owner/repo --apply           # 给已有 Skill 补登记来源，供 check-updates 用
+skillctl check-updates            # 检查所有登记过来源的 Skill 是否有上游更新（不联网改动任何东西）
 skillctl deactivate skill-name --apply
-skillctl archive skill-name --apply
-skillctl restore skill-name --apply
-skillctl restore skill-name --archive-id 20260814-124500-ab12cd34 --reactivate --apply
 skillctl export skill-name                                    # 默认输出到 ~/Desktop/skill-export-skill-name/
 skillctl export skill-name --output /absolute/path/to/somewhere
 ```
 
 `export` 把仓库里的一个 Skill 打包成不带仓库登记信息的干净拷贝（只有 `SKILL.md` 和内容目录），用来手动上传到 claude.ai 账户库或分享给他人；只读操作，不需要 `--apply`，目标路径已存在时会拒绝执行、不覆盖。
 
-`import` 默认复制来源、不删除原目录；仓库里已有同名同内容版本时报告"已存在"并保持不变，同名不同内容时默认停止，只有显式 `--replace --apply` 才会先把旧版本归档、再换成新版本，且复制失败会自动回滚到旧版本。`--display-name` 是可选参数：首次导入且仓库里没有对应别名时，不提供就默认 `display_name = id`（即中文名展示位置显示英文 id，不会自行翻译）；想要一个中文名，用 `--display-name` 显式提供。
+`import` 默认复制来源、不删除原目录；仓库里已有同名同内容版本时报告"已存在"并保持不变，同名不同内容时默认停止，只有显式 `--replace --apply` 才会先把旧版本换成新版本（换之前会挪进系统废纸篓），且复制失败会自动回滚到旧版本。`--display-name` 是可选参数：首次导入且仓库里没有对应别名时，不提供就默认 `display_name = id`（即中文名展示位置显示英文 id，不会自行翻译）；想要一个中文名，用 `--display-name` 显式提供。
 
-`deactivate` 只移除受管软链；`archive` 把真实 Skill 移入带时间戳和内容哈希的归档目录（`archive/<id>/<归档ID>/`），并写入记录原场景包和受管链接的清单；`restore` 默认恢复最近一个版本但不重新激活，多个历史版本可用 `--archive-id` 指定，只有 `--reactivate --apply` 才会尝试恢复原受管软链（遇到冲突会安全跳过并告警，不覆盖）。没有永久删除命令，`archive` 是唯一的"下架"方式（软删除，可恢复）。
+`import-github` 复用 `import` 的同一套安全检查（哈希去重、`--replace` 先把旧版本挪进废纸篓、`--activate`），多加一步：clone 到临时目录、定位 `SKILL.md`、给一段来源预览（声明的 name/description、带没带可执行脚本）供你确认后再落地。仓库根目录没有 `SKILL.md` 时会自动找出仓库里所有真正挂着 `SKILL.md` 的目录（不管套了几层分类）列成候选，提示你用 `--path` 指定；链接里混进的零宽空格、全角标点会被自动规整，不会因为这类不可见字符直接报"链接格式不对"或悄悄拼错 owner/repo。
+
+`deactivate` 只移除受管软链，Skill 本身还在仓库里（状态变回"仓库中"）。**没有 CLI 级别的永久删除命令**——想要连仓库里的内容一起清掉，要么手动删除 `skills/<id>/` 目录，要么用 `dashboard serve`（本地服务模式）里的"删除模式"，那边点了按钮之后会把 Skill 目录整个挪进系统废纸篓（不是本项目自己的归档区，用系统自带的"最近删除"/Trash 找回）。
 
 ### 体检与内容质量：`doctor` / `lint`
 
@@ -167,12 +172,12 @@ skillctl import "$(pwd)/skill-router" --activate --apply
 
 `--activate` 会把它记进 `state/manual.list`，之后切场景包也不会被清掉，不需要另外编辑 `config/profiles/core`。
 
-## 已知软件适配器（九个）
+## 已知软件适配器（十个）
 
 原生模式（直接共享 `~/.agents/skills`，无需连接）：`codex`（ChatGPT 客户端内的 Codex 功能）、`cursor`、`gemini-cli`。
-软链模式（有独立的 Skill 目录，需要 `tools connect` 建立软链）：`claude-code`、`kiro`、`trae`、`trae-cn`（TraeCode CN，独立数据目录）、`codebuddy`、`qoder`。
+软链模式（有独立的 Skill 目录，需要 `tools connect` 建立软链）：`claude-code`、`kiro`、`trae`、`trae-cn`（TraeCode CN，独立数据目录）、`codebuddy`、`qoder`、`windsurf`。
 
-**格式兼容性**：以上九个都能直接接入，前提是它们识别 Skill 的方式跟本仓库一致——一个目录、根目录一份 `SKILL.md`（YAML frontmatter 含 `name`/`description`，正文任意 Markdown）。仓库对外分发的就是这个格式本身，不做任何转换；如果某个工具用的是别的清单格式（比如 JSON manifest），软链过去它大概率读不出来，不能直接照抄这九个的接法，见下面"接入清单外的工具"。
+**格式兼容性**：以上十个都能直接接入，前提是它们识别 Skill 的方式跟本仓库一致——一个目录、根目录一份 `SKILL.md`（YAML frontmatter 含 `name`/`description`，正文任意 Markdown）。仓库对外分发的就是这个格式本身，不做任何转换；如果某个工具用的是别的清单格式（比如 JSON manifest），软链过去它大概率读不出来，不能直接照抄这十个的接法，见下面"接入清单外的工具"。
 
 ```bash
 skillctl tools detect
@@ -180,13 +185,13 @@ skillctl tools connect claude-code --apply
 skillctl tools disconnect claude-code --apply
 ```
 
-`tools detect` 按"检测到应用或命令行工具 → 已检测；没有应用/命令行但目录已存在 → 可能是残留目录；两者都没有 → 未检测到"的顺序判断，只覆盖以上九个已批准的软件，不会检测或连接清单之外的工具。软链模式的连接只同步**当前激活集合**（`~/.agents/skills` 里的受管软链），不会把整个仓库分发出去；标记为 `unverified` 的适配器默认拒绝连接，需要显式加 `--allow-unverified`。
+`tools detect` 按"检测到应用或命令行工具 → 已检测；没有应用/命令行但目录已存在 → 可能是残留目录；两者都没有 → 未检测到"的顺序判断，只覆盖以上十个已批准的软件，不会检测或连接清单之外的工具。软链模式的连接只同步**当前激活集合**（`~/.agents/skills` 里的受管软链），不会把整个仓库分发出去；标记为 `unverified` 的适配器默认拒绝连接，需要显式加 `--allow-unverified`。
 
-`app_name` 靠精确匹配 `/Applications/<app_name>.app` 这个文件夹名判断，`cli_command` 靠 `command -v` 查 PATH，两者都不做模糊匹配——本地化显示名、渠道版后缀（如" CN"）跟真实文件夹名对不上，就会被判定"未检测到"，需要手动核实真实文件夹名后修正 `app_name`（`skillctl doctor` 会把这种情况和真的没装区分开，分别给出不同的下一步建议）。`verification` 字段目前只是给人看的说明文字，`tools detect`/面板都不展示它，唯一起作用的场景是字面**精确等于** `unverified` 时触发连接拦截；随包的九个适配器该字段都是描述性中文句子，没有一个会被拦截。
+`app_name` 靠精确匹配 `/Applications/<app_name>.app` 这个文件夹名判断，`cli_command` 靠 `command -v` 查 PATH，两者都不做模糊匹配——本地化显示名、渠道版后缀（如" CN"）跟真实文件夹名对不上，就会被判定"未检测到"，需要手动核实真实文件夹名后修正 `app_name`（`skillctl doctor` 会把这种情况和真的没装区分开，分别给出不同的下一步建议）。`verification` 字段目前只是给人看的说明文字，`tools detect`/面板都不展示它，唯一起作用的场景是字面**精确等于** `unverified` 时触发连接拦截；随包的十个适配器该字段都是描述性中文句子，没有一个会被拦截。
 
 ## 接入清单外的工具
 
-不在上面九个批准名单里的工具，接入前先确认它是否也用 `SKILL.md`（YAML frontmatter + Markdown 正文，`name`/`description` 必填）识别 Skill——本仓库对外分发的就是这个原始格式，不做任何转换。格式不兼容的工具无法通过软链直接接入。
+不在上面十个批准名单里的工具，接入前先确认它是否也用 `SKILL.md`（YAML frontmatter + Markdown 正文，`name`/`description` 必填）识别 Skill——本仓库对外分发的就是这个原始格式，不做任何转换。格式不兼容的工具无法通过软链直接接入。
 
 确认兼容后，在 `config/adapters/tools.tsv` 里加一行（tab 分隔，8 列）：
 
@@ -211,16 +216,36 @@ id	display_zh	mode	global_dir	project_dir	cli_command	app_name	verification
 trae-cn	TraeCode CN	link	~/.trae-cn/skills	.trae-cn/skills		Trae CN	确认软链目标为 ~/.agents/skills
 ```
 
-加完这一行，先 `skillctl tools detect` 确认显示"已检测"（不是就回去核实 `app_name`/`cli_command`），再 `skillctl tools connect <新id>` 不带 `--apply` 看预演结果，确认无误后再 `--apply` 正式连接。验证过一个新适配器、确认真实可用之后，欢迎提 PR 加进默认九个里。
+加完这一行，先 `skillctl tools detect` 确认显示"已检测"（不是就回去核实 `app_name`/`cli_command`），再 `skillctl tools connect <新id>` 不带 `--apply` 看预演结果，确认无误后再 `--apply` 正式连接。验证过一个新适配器、确认真实可用之后，欢迎提 PR 加进默认十个里。
 
-## 只读面板
+## 面板：静态快照 vs 本地服务
+
+面板有两种运行模式，二选一，中文优先、英文 ID 弱化展示为技术信息，左侧导航固定四块：总览、Skill 列表、场景包、软件接入，右上角有日间/夜间/跟随系统的主题切换（记在浏览器本地，刷新不丢）。
+
+### 静态快照
 
 ```bash
 skillctl dashboard build --apply
 skillctl dashboard open
 ```
 
-面板是自动生成的自包含 HTML（`dashboard/index.html`），中文优先、英文 ID 弱化展示为技术信息，打开先看到 Skill 文件夹的真实绝对路径（带复制按钮，粘贴到 Finder"前往文件夹" Cmd+Shift+G 可直接跳转，路径随每个人的真实环境自动识别，不是写死的），然后是顶部统计卡片（全部/已激活/仓库中/已归档/缺失冲突各多少个），再往下是 Skill 列表、场景包成员、归档记录、真实目录/外部软链冲突，以及九个适配器的检测状态。归档区块头部同样有一个"归档文件夹"地址（带复制按钮），指向 `archive/` 这个总目录，每个 Skill 归档后就放在这个文件夹下自己的 `<id>` 子目录里。Skill 列表支持按 id/中文名/简介实时搜索（不用点搜索按钮），以及两个互斥的点选模式：「归档模式」开启后点选条目显示红色边框，底部浮出红色「复制归档命令」按钮，点击把对应的 `skillctl archive <id> --apply` 复制到剪贴板并提示"归档是可恢复的下架，随时能用 restore 恢复"；「激活/停用模式」开启后点选条目显示蓝色边框，按每一项**当前的状态**分别生成 `activate` 或 `deactivate`（已激活的生成停用命令，仓库中的生成激活命令），底部浮出蓝色「复制命令」按钮——多选时每个 id 各生成一行命令，混着已激活和未激活的一起选也能一次拿到全部正确的命令。开启任一模式会自动关掉另一个并清空已选。页面标题旁明确标注"只读面板"；所有交互都是纯前端生成命令 + 复制到剪贴板，不新增本地服务，内联脚本不包含任何 `fetch` 或写入型请求。生成失败时保留上一版面板，不会留下半成品文件。`activate`/`deactivate`/`profile use`/`tools connect`/`tools disconnect`/`eject`（以及带 `--activate`/`--reactivate` 的 `import`/`restore`）这些改变激活或连接状态的 `--apply` 命令成功后会自动跑一次 `dashboard build`，一般不需要手动重建；但打开页面看还是要自己跑 `dashboard open`，这一步不会自动发生。
+自动生成的自包含 HTML（`dashboard/index.html`），本身不执行任何写操作——Skill 列表支持勾选（常驻模式/移入仓库模式/删除模式三选一，按当前状态过滤可选行），选完点"复制命令"，把对应的 `activate`/`deactivate` 命令拼好复制到剪贴板，回终端粘贴执行。`activate`/`deactivate`/`profile use`/`tools connect`/`tools disconnect`/`eject`（以及带 `--activate` 的 `import`/`import-github`）这些改变激活或连接状态的 `--apply` 命令成功后会自动跑一次 `dashboard build`，一般不需要手动重建；但打开页面看还是要自己跑 `dashboard open`，这一步不会自动发生。生成失败时保留上一版面板，不会留下半成品文件。
+
+### 本地服务
+
+```bash
+skillctl dashboard serve
+```
+
+起一个只监听 `127.0.0.1` 的本地后端（`bin/dashboard-server.py`），每次启动随机分配端口和一次性 session token，每个写请求都校验 token 和 `Host` 头，不接受局域网或公网访问。这个模式下面板按钮点了直接生效，不用再复制命令到终端：
+
+- **常驻模式 / 移入仓库模式 / 删除模式**：跟静态快照一样是三选一的批量勾选，但点确认后直接执行；删除模式会把 Skill 目录整个挪进系统废纸篓（"最近删除"，不是本项目自己的归档区，可以用系统自带的恢复方式找回）。同一批打包导入的 Skill 如果只选中了一部分，会先弹窗提示同批还有哪些没选，问要不要一起处理。
+- **从 GitHub 导入**：输入仓库 URL（也认 `.../tree/<ref>/<子路径>` 这种浏览器地址栏形式，自动拆出 ref 和子路径），先克隆到临时目录做只读预览（声明的 name/description、带没带可执行脚本），确认后才真正落地；仓库里有多个 Skill 时会列出所有候选路径，支持勾选多个一次性批量导入，导入中的每一项独立显示进度。
+- **本地拖拽导入**：把一个 Skill 文件夹或打包好的 `.zip` 直接拖进浏览器，收编进仓库。
+- **检查更新**：对所有用 `track-source`/`import-github` 登记过来源的 Skill，批量检查上游是否有新内容。
+- **+ 添加平台**：注册内置十个适配器之外的工具，补一行 `config/adapters/tools.tsv`。
+
+不想用本地服务了，`Ctrl+C` 停掉进程即可；停掉之后双击面板文件看到的还是最后一次生成的静态快照，只是按钮点了不再生效。
 
 ## 迁移已有的 Skill
 
@@ -244,7 +269,7 @@ skillctl dashboard open
 这个项目管的是"我自己已经写好的 Skill，怎么在我用的好几个工具之间共享"，不是内容分发。跟"从哪找到别人写的 Skill"是两个不同的问题，本项目不打算做后者（见 [ROADMAP](ROADMAP.md)）。
 
 **为什么不做成一个桌面 GUI？**
-命令行 + 本地只读 HTML 面板已经覆盖日常需要的操作和查看场景，加一层 GUI 增加的是维护成本，不是能力。市面上已经有走 GUI 路线的同类项目（比如 Skills Dock），路线不同，各取所需。
+命令行 + 浏览器面板（静态快照或 `dashboard serve` 本地服务二选一）已经覆盖日常需要的操作和查看场景，加一层原生 GUI 增加的是维护成本，不是能力。`dashboard serve` 那个本地后端也只绑定 `127.0.0.1`，不打包成 App、不装菜单栏图标，仍然是"浏览器 + 一个只读本机的小进程"，跟独立的桌面客户端是两回事。市面上已经有走原生 GUI 路线的同类项目（比如 Skills Dock），路线不同，各取所需。
 
 **支持 Windows/Linux 吗？**
 不支持，短期内也不打算支持。核心实现依赖 macOS 专属的 `ditto`（保真度更好的文件拷贝）和 `/Applications` 应用检测，移植需要重新设计文件操作层。
@@ -258,9 +283,9 @@ skillctl dashboard open
 ## 发布前检查清单（维护者自查）
 
 - [x] 仓库名（skill-warehouse）与命令名（skillctl）分离，两者独立检索均未发现直接冲突
-- [x] 全部脚本通过 `shellcheck`
-- [x] 干净账户（无既有 `~/.skill-library`）走通一遍上面的 Quickstart
-- [x] 文档描述的行为与代码实际行为逐条核对一致
+- [x] 全部脚本通过 `shellcheck`（v2 复查：新增的 `dashboard-server.py` 装机路径也过了 Python 语法检查）
+- [x] 干净账户（无既有 `~/.skill-library`）走通一遍上面的 Quickstart（v2 复查：含新增的 `dashboard-server.py` 是否被 `install-manager.sh` 正确装上）
+- [x] 文档描述的行为与代码实际行为逐条核对一致（v2 复查：`archive`/`restore` 已从代码里整体移除，README 不再提及；命令参考、面板章节按当前真实行为重写）
 - [ ] 首次公开发布前，把 `LICENSE` 里的版权署名换成你希望使用的名义（默认写的是 "skill-warehouse contributors"）
 
 ## License

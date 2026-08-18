@@ -212,7 +212,7 @@ deactivate_id() {
 
 # 手动激活列表：记录通过 `activate <id> --apply` 单独激活（不经由场景包）的
 # skill id，一行一个。profile_ids() 把它并进目标集合，使 `profile use` 切换
-# 场景包时不会静默清掉这些手动激活的 skill；`deactivate`/归档会把对应 id
+# 场景包时不会静默清掉这些手动激活的 skill；`deactivate` 会把对应 id
 # 移出这份名单。文件不存在时一律视为空，不是错误。
 resolve_manual_list_file() {
   printf '%s\n' "$SKILL_LIBRARY_ROOT/state/manual.list"
@@ -484,18 +484,10 @@ link_status() {
 }
 
 stored_status() {
-  local id="$1" relative_path="$2" archive_path
+  local relative_path="$1"
   if [ -d "$SKILL_LIBRARY_ROOT/$relative_path" ]; then
     printf '仓库中\n'
-  elif [ -d "$SKILL_LIBRARY_ROOT/archive/$id" ]; then
-    printf '已归档\n'
   else
-    for archive_path in "$SKILL_LIBRARY_ROOT/archive/$id"-*; do
-      if [ -d "$archive_path" ]; then
-        printf '已归档\n'
-        return 0
-      fi
-    done
     printf '缺失\n'
   fi
 }
@@ -505,7 +497,7 @@ print_status() {
   while IFS="$(printf '\t')" read -r id relative_path display _aliases _category _triggers _excludes _description; do
     [ -n "$id" ] || continue
     status="$(link_status "$GLOBAL_SKILLS_DIR/$id" "$relative_path")"
-    [ -n "$status" ] || status="$(stored_status "$id" "$relative_path")"
+    [ -n "$status" ] || status="$(stored_status "$relative_path")"
     printf '全局\t%s\t%s\t%s\n' "$status" "$display" "$id"
 
     project_status="$(link_status "$PROJECT_SKILLS_DIR/$id" "$relative_path")"
@@ -682,8 +674,6 @@ collect_profiles_for_id() {
   printf '%s\n' "$result"
 }
 
-ARCHIVE_MANAGED_LINK=""
-
 # doctor 的检查结果计数器，由 doctor_report() 累加，cmd_doctor() 在开始时重置。
 DOCTOR_OK=0
 DOCTOR_WARN=0
@@ -694,143 +684,28 @@ LINT_OK=0
 LINT_WARN=0
 LINT_FAIL=0
 
-archive_check() {
-  local id="$1" relative_path target link expected destination safe_destination standard_target
-  relative_path="skills/$id"
-  target="$SKILL_LIBRARY_ROOT/$relative_path"
-  real_dir "$target" >/dev/null 2>&1 || { printf '仓库中没有 %s，无法归档\n' "$id" >&2; return 1; }
-
-  ARCHIVE_MANAGED_LINK=""
-  link="$GLOBAL_SKILLS_DIR/$id"
-  if [ -L "$link" ]; then
-    expected="$(expected_target "$relative_path" 2>/dev/null || true)"
-    destination="$(dirname "$link")"
-    safe_destination="$(safe_link_directory "$destination" 2>/dev/null || true)"
-    standard_target=""
-    if [ -n "$expected" ] && [ -n "$safe_destination" ]; then
-      standard_target="$(relative_link_target "$safe_destination" "$expected")"
-    fi
-    if [ -n "$standard_target" ] && managed_link_matches "$link" "$expected" "$standard_target"; then
-      ARCHIVE_MANAGED_LINK="$GLOBAL_SKILLS_DIR"
-    else
-      printf '无法确认归属的引用，停止归档：%s\n' "$link" >&2
-      return 1
-    fi
-  elif [ -e "$link" ]; then
-    printf '无法确认归属的引用，停止归档：%s\n' "$link" >&2
-    return 1
-  fi
-  return 0
-}
-
-archive_execute() {
-  local id="$1" managed="$2" relative_path target hash archived_at archive_id profiles manifest tmp_manifest
-  relative_path="skills/$id"
-  target="$SKILL_LIBRARY_ROOT/$relative_path"
-  hash="$(directory_content_hash "$target")" || return 1
-  archived_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  archive_id="$(date -u '+%Y%m%d-%H%M%S')-${hash:0:8}"
-  profiles="$(collect_profiles_for_id "$id")"
-
-  [ -z "$managed" ] || deactivate_id "$GLOBAL_SKILLS_DIR" "$id" "yes" >/dev/null
-  manual_list_remove "$id"
-
-  mkdir -p "$SKILL_LIBRARY_ROOT/archive/$id" || return 1
-  mv "$target" "$SKILL_LIBRARY_ROOT/archive/$id/$archive_id" || return 1
-
-  # archive_id has one-second resolution; re-archiving identical content
-  # within the same second reuses the same ID. Replace any stale manifest
-  # row for that ID instead of appending a duplicate, so a lookup by
-  # archive_id always finds exactly one (the current) row.
-  manifest="$SKILL_LIBRARY_ROOT/archive/$id/manifest.tsv"
-  tmp_manifest="$(mktemp "$SKILL_LIBRARY_ROOT/archive/$id/.manifest.tsv.XXXXXX")" || return 1
-  if [ -f "$manifest" ]; then
-    awk -F '\t' -v aid="$archive_id" '$2 != aid' "$manifest" > "$tmp_manifest"
-  fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$archive_id" "$hash" "$archived_at" "$profiles" "$managed" >> "$tmp_manifest"
-  mv "$tmp_manifest" "$manifest" || return 1
-  printf '%s\n' "$archive_id"
-}
-
-cmd_archive() {
-  local id="$1" apply="$2" archive_id
-  archive_check "$id" || return 1
-  if [ "$apply" != "yes" ]; then
-    printf '[预演] 归档 %s -> archive/%s/<archive_id>\n' "$id" "$id"
-    [ -n "$ARCHIVE_MANAGED_LINK" ] && printf '[预演] 归档将移除受管软链 %s/%s\n' "$ARCHIVE_MANAGED_LINK" "$id"
+# 用 Finder 的"移到废纸篓"语义删除一个路径：可反悔，不是 rm -rf。跟
+# dashboard-server.py 的 move_to_trash 是同一个策略（Finder 走不通就退回
+# 直接挪进 ~/.Trash），这里是 CLI 自己要用的 bash 版本——import --replace
+# 覆盖旧版本时靠这个，不再走仓库内部的 archive/ 备份那一套。
+trash_path() {
+  local path="$1" dest
+  [ -e "$path" ] || return 0
+  if command -v osascript >/dev/null 2>&1 && \
+     osascript -e "tell application \"Finder\" to delete (POSIX file \"$path\" as alias)" >/dev/null 2>&1; then
     return 0
   fi
-  archive_id="$(archive_execute "$id" "$ARCHIVE_MANAGED_LINK")" || { printf '归档失败：%s\n' "$id" >&2; return 1; }
-  printf '[已归档] %s -> archive/%s/%s\n' "$id" "$id" "$archive_id"
-  rebuild_catalog_or_warn
-  auto_rebuild_dashboard
+  dest="$HOME/.Trash/$(basename "$path").$(date +%H%M%S)"
+  mv "$path" "$dest"
 }
 
-restore_pick_archive_id() {
-  local id="$1" requested="$2" dir
-  if [ -n "$requested" ]; then
-    [ -d "$SKILL_LIBRARY_ROOT/archive/$id/$requested" ] && printf '%s\n' "$requested"
-    return 0
-  fi
-  for dir in "$SKILL_LIBRARY_ROOT/archive/$id"/*/; do
-    [ -d "$dir" ] || continue
-    basename "${dir%/}"
-  done | LC_ALL=C sort | tail -n 1
-}
-
-reactivate_from_manifest() {
-  local id="$1" archive_id="$2" manifest_row managed_field managed_dirs dest
-  manifest_row="$(awk -F '\t' -v aid="$archive_id" '$2 == aid { print; exit }' "$SKILL_LIBRARY_ROOT/archive/$id/manifest.tsv" 2>/dev/null || true)"
-  managed_field="$(printf '%s' "$manifest_row" | awk -F '\t' '{ print $6 }')"
-  [ -n "$managed_field" ] || return 0
-  IFS=',' read -ra managed_dirs <<< "$managed_field"
-  for dest in "${managed_dirs[@]}"; do
-    [ -n "$dest" ] || continue
-    apply_link_for_id "$dest" "$id" "yes"
-  done
-}
-
-cmd_restore() {
-  local id="$1" requested="$2" reactivate="$3" apply="$4" archive_id
-
-  real_dir "$SKILL_LIBRARY_ROOT/skills/$id" >/dev/null 2>&1 && {
-    printf '仓库已存在同名 Skill：%s\n' "$id" >&2
-    return 1
-  }
-
-  archive_id="$(restore_pick_archive_id "$id" "$requested")"
-  [ -n "$archive_id" ] || { printf '没有可恢复的归档版本：%s\n' "$id" >&2; return 1; }
-
-  if [ "$apply" != "yes" ]; then
-    printf '[预演] 恢复 %s -> skills/%s（版本 %s）\n' "$id" "$id" "$archive_id"
-    [ "$reactivate" = "yes" ] && printf '[预演] 恢复后重新激活受管软链\n'
-    return 0
-  fi
-
-  mv "$SKILL_LIBRARY_ROOT/archive/$id/$archive_id" "$SKILL_LIBRARY_ROOT/skills/$id" || {
-    printf '恢复失败：%s\n' "$id" >&2
-    return 1
-  }
-  printf '[已恢复] %s -> skills/%s\n' "$id" "$id"
-  rebuild_catalog_or_warn
-
-  if [ "$reactivate" = "yes" ]; then
-    reactivate_from_manifest "$id" "$archive_id"
-    auto_rebuild_dashboard
-  fi
-  return 0
-}
-
-rollback_replace() {
-  local id="$1" archive_id="$2"
-  mv "$SKILL_LIBRARY_ROOT/archive/$id/$archive_id" "$SKILL_LIBRARY_ROOT/skills/$id" 2>/dev/null || return 1
-  reactivate_from_manifest "$id" "$archive_id"
-  rebuild_catalog_or_warn
-  return 0
-}
-
+# 覆盖式导入：新内容先落到 staging 目录、用哈希验证完整无误，验证通过才
+# 动旧目录（挪进废纸篓）、再把 staging 换到位——安全窗口来自"先备好验证过
+# 的新内容再删旧的"这个顺序本身，不需要仓库内部再单独留一份归档备份。
+# staging 阶段失败的话旧目录完全没被碰过，直接原样保留。
 import_copy_into_warehouse() {
-  local real_source="$1" id="$2" staging_dir source_hash copied_hash
+  local real_source="$1" id="$2" staging_dir source_hash copied_hash target_dir
+  target_dir="$SKILL_LIBRARY_ROOT/skills/$id"
   staging_dir="$SKILL_LIBRARY_ROOT/skills/.staging-$id"
   mkdir -p "$SKILL_LIBRARY_ROOT/skills" 2>/dev/null || true
   if ! mkdir "$staging_dir" 2>/dev/null; then
@@ -846,8 +721,16 @@ import_copy_into_warehouse() {
     rm -rf "$staging_dir"
     return 1
   fi
-  if ! mv "$staging_dir/$id" "$SKILL_LIBRARY_ROOT/skills/$id"; then
+  if [ -e "$target_dir" ]; then
+    if ! trash_path "$target_dir"; then
+      rm -rf "$staging_dir"
+      printf '旧版本移入废纸篓失败，新版本已验证但未落地：%s\n' "$staging_dir/$id" >&2
+      return 1
+    fi
+  fi
+  if ! mv "$staging_dir/$id" "$target_dir"; then
     rm -rf "$staging_dir"
+    printf '新版本落地失败，旧版本已经在废纸篓，请从废纸篓手动找回：%s\n' "$id" >&2
     return 1
   fi
   rmdir "$staging_dir" 2>/dev/null || true
@@ -922,6 +805,23 @@ cmd_import() {
     target_hash="$(directory_content_hash "$target_dir" 2>/dev/null || true)"
     if [ -n "$target_hash" ] && [ "$target_hash" = "$source_hash" ]; then
       printf '[已存在] %s 内容相同，无需变更\n' "$id"
+      # 内容没变不代表"什么都不用做"——用户传了 --activate 就是想要这个
+      # skill 处于激活状态，这里以前直接 return 0，--activate 被悄悄吞
+      # 掉，连预演提示都没有，看着像是命令生效了实际什么也没发生。跟下面
+      # "有实际改动"那条路径保持一致：预演模式给提示，--apply 才真的激活。
+      if [ "$activate" = "yes" ]; then
+        if [ "$apply" != "yes" ]; then
+          printf '[预演] 导入后激活 %s\n' "$id"
+        else
+          APPLY_LINK_STATUS="skipped"
+          apply_link_for_id "$GLOBAL_SKILLS_DIR" "$id" "yes"
+          if [ "$APPLY_LINK_STATUS" = "managed" ]; then
+            manual_list_add "$id"
+          fi
+          auto_rebuild_dashboard
+          printf '[已激活] %s\n' "$id"
+        fi
+      fi
       return 0
     fi
     if [ "$replace" != "yes" ]; then
@@ -936,7 +836,7 @@ cmd_import() {
 
   if [ "$apply" != "yes" ]; then
     if [ "$mode" = "replace" ]; then
-      printf '[预演] 替换 %s（旧版本先归档）-> skills/%s\n' "$id" "$id"
+      printf '[预演] 替换 %s（旧版本移入废纸篓）-> skills/%s\n' "$id" "$id"
     else
       printf '[预演] 导入 %s -> skills/%s\n' "$id" "$id"
     fi
@@ -949,25 +849,13 @@ cmd_import() {
     return 0
   fi
 
-  local archived_old_id=""
-  if [ "$mode" = "replace" ]; then
-    archive_check "$id" || { printf '归档旧版本失败，导入终止\n' >&2; return 1; }
-    archived_old_id="$(archive_execute "$id" "$ARCHIVE_MANAGED_LINK")" || {
-      printf '归档旧版本失败，导入终止\n' >&2
-      return 1
-    }
-  fi
-
+  # import_copy_into_warehouse 自己负责"新内容先验证、旧目录再挪进废纸
+  # 篓"这个顺序——staging 失败旧目录完全不受影响，不需要在这里再单独处理
+  # replace 分支。也正因为整个替换只是原地换掉 skills/$id 目录本身的内容、
+  # 从没碰过任何软链，替换前已经激活的话替换后自动还是激活状态，不需要
+  # 额外传 --activate 才能保住。
   if ! import_copy_into_warehouse "$real_source" "$id"; then
-    if [ -n "$archived_old_id" ]; then
-      if rollback_replace "$id" "$archived_old_id"; then
-        printf '导入新版本失败，已回滚到旧版本\n' >&2
-      else
-        printf '导入新版本失败，回滚也失败，请手动检查 archive/%s/%s\n' "$id" "$archived_old_id" >&2
-      fi
-    else
-      printf '导入失败\n' >&2
-    fi
+    printf '导入失败\n' >&2
     return 1
   fi
 
@@ -980,15 +868,550 @@ cmd_import() {
   rebuild_catalog_or_warn
 
   if [ "$activate" = "yes" ]; then
+    # 跟独立的 activate 命令保持一致：只建软链不够，还得登记进
+    # manual.list，不然 doctor 会报"有受管软链但未登记"——这里之前漏了
+    # 这一步（历史遗留，import --activate 一直是这样），import-github
+    # 走到这条路径时复现了出来，顺手一起补上。
+    APPLY_LINK_STATUS="skipped"
     apply_link_for_id "$GLOBAL_SKILLS_DIR" "$id" "yes"
+    if [ "$APPLY_LINK_STATUS" = "managed" ]; then
+      manual_list_add "$id"
+    fi
     auto_rebuild_dashboard
   fi
   printf '[已导入] %s -> skills/%s\n' "$id" "$id"
 }
 
+# 从 GitHub 导入：clone 到临时目录、定位 SKILL.md、给一眼内容预览，然后
+# 复用 cmd_import 本身那一整套安全检查（哈希去重、--replace 先把旧版本
+# 挪进废纸篓、别名保留、--activate、catalog 重建），不重新实现一遍。
+#
+# 安全边界：
+# - 只认 https://github.com/<owner>/<repo> 或其 /tree/<ref>/<子路径> 形式，
+#   owner/repo 只允许 GitHub 合法字符集，且整个 clone URL 恒以 https://
+#   字面量开头——即使字符集里混进 -，拼出来的 URL 也不可能被 git 当成选项。
+# - --path 子路径拒绝绝对路径和 ..，并在 clone 完成后用 path_is_ancestor
+#   验证解析结果确实还在克隆目录内部，防止跳出去读克隆目录外的文件。
+# - GIT_TERMINAL_PROMPT=0：私有仓库或仓库不存在时 git 会直接失败退出，
+#   不会挂在交互式认证提示上卡住整个命令。
+# - 临时克隆目录在每个 return 路径前手动清理（这台机器的系统 /bin/bash
+#   3.2 上 trap ... RETURN 实测不可靠，预演分支没触发过，会在 $TMPDIR
+#   底下攒垃圾——不用 trap，显式、可验证）。
+#
+# 真正的 clone 动作在 clone_github_repo 里，这里只做 URL 解析和调用；
+# check-updates 批量检查时也会直接调这个 helper，跳开 cmd_import_github
+# 自己的预览/落地逻辑，避免同一个仓库因为登记了好几个 skill 就被重复
+# clone 好几遍。
+clone_github_repo() {
+  local owner="$1" repo="$2" ref="$3" subpath="$4"
+  command -v git >/dev/null 2>&1 || { printf '需要 git，未检测到\n' >&2; return 1; }
+
+  local tmpdir
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/skillctl-github-clone.XXXXXX")" || {
+    printf '创建临时目录失败\n' >&2
+    return 1
+  }
+
+  local clone_url="https://github.com/$owner/$repo.git" ref_note=""
+  [ -n "$ref" ] && ref_note="（ref: ${ref}）"
+  printf '克隆 %s%s ...\n' "$clone_url" "$ref_note" >&2
+  # 这几个 clone 永远是匿名拉公开仓库，不该也不需要任何凭证——但如果用户
+  # 全局 git 配置里给 github.com 配了 credential.helper（很常见，比如
+  # `gh auth git-credential`），git 匿名 clone 时仍然会先尝试调用它。那
+  # 个 helper 进程本身在这台机器上、由这个后台服务的环境变量/PATH/无 TTY
+  # 启动时可能失败或者行为跟交互式终端不一样，进而把整个 clone 拖挂——
+  # 加 -c credential.helper=（空值）显式关掉，绕开这一整类问题，不用去
+  # 猜 gh 到底为什么在这个环境里出问题。
+  local -a clone_args=(-c credential.helper= clone --depth 1 --quiet)
+  [ -n "$ref" ] && clone_args+=(--branch "$ref")
+  clone_args+=("$clone_url" "$tmpdir/repo")
+  # git 自己的报错之前直接扔进 /dev/null 了，只留一句"检查仓库是否存
+  # 在、ref 是否正确、网络是否可达"的通用猜测——真出问题时看不出到底是
+  # 哪一种，排查全靠猜。现在接一份 git 的真实 stderr，带在错误里一起报。
+  local git_err
+  git_err="$(mktemp "${TMPDIR:-/tmp}/skillctl-git-err.XXXXXX")" || {
+    printf '创建临时文件失败\n' >&2
+    rm -rf "$tmpdir"
+    return 1
+  }
+  if ! GIT_TERMINAL_PROMPT=0 git "${clone_args[@]}" >/dev/null 2>"$git_err"; then
+    local git_msg
+    git_msg="$(tail -1 "$git_err" 2>/dev/null)"
+    rm -f "$git_err"
+    # GitHub 匿名 clone 一个不存在的仓库和一个私有仓库，服务端返回的都是
+    # 401（不这样的话匿名请求就能靠"存在返回404/私有返回401"的差异来探测
+    # 私有仓库是否存在，这是 GitHub 故意的行为）——git 因此会尝试要用户名
+    # 密码，而 GIT_TERMINAL_PROMPT=0 又不让它弹交互式提示，于是永远是这
+    # 句"could not read Username"，只讲清楚了"卡在要认证"这个机制细节，
+    # 完全没告诉人真正该往哪个方向查。这种情况下 99% 都是拼错了 owner/
+    # repo 或者仓库真不存在，比模糊的原始 git 报错有用得多，值得单独识别
+    # 出来给一句人话提示。
+    if printf '%s' "$git_msg" | grep -q 'could not read Username\|Authentication failed\|could not read Password'; then
+      printf '克隆失败：%s（仓库不存在，或是私有仓库匿名访问不了——先确认 owner/repo 拼写没错。git 报错：%s）\n' "$clone_url" "$git_msg" >&2
+    elif [ -n "$git_msg" ]; then
+      printf '克隆失败：%s（git 报错：%s）\n' "$clone_url" "$git_msg" >&2
+    else
+      printf '克隆失败：%s（检查仓库是否存在、ref 是否正确、网络是否可达）\n' "$clone_url" >&2
+    fi
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  rm -f "$git_err"
+  # 浅克隆的 .git 目录从没被用到过（不需要历史，只要工作区文件），留着
+  # 会有两个真实后果：--path 留空导入仓库根目录时，.git 会被当成"内容"
+  # 一起 ditto 进仓库（把整份 git 元数据永久拷进 skills/<id>/ 里）；即使
+  # 有 --path，.git 也会被 directory_content_hash 算作根目录内容的一部
+  # 分，而同一个仓库每次重新 clone 出来的 .git 内部结构本身就不是逐字
+  # 节稳定的——check-updates 拿这类哈希做比对会不该报"有更新"时误报。
+  # 提前删掉，克隆结果只剩纯工作区文件。
+  rm -rf "$tmpdir/repo/.git"
+
+  local repo_real resolved
+  repo_real="$(real_dir "$tmpdir/repo" 2>/dev/null || true)"
+  if [ -z "$repo_real" ]; then
+    printf '克隆结果异常\n' >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if [ -n "$subpath" ]; then
+    resolved="$(real_dir "$repo_real/$subpath" 2>/dev/null || true)"
+  else
+    resolved="$repo_real"
+  fi
+  if [ -z "$resolved" ] || ! path_is_ancestor "$repo_real" "$resolved"; then
+    printf '子路径不存在或越界：%s\n' "$subpath" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  # 三行输出：tmpdir（调用方用完自己 rm -rf）、repo_real（仓库根目录，
+  # 给"没找到 SKILL.md，猜是多 skill 仓库"那个提示用）、resolved（真正
+  # 要用的目录）。不用 eval 或 nameref 往调用方变量里塞值——这台机器的
+  # 系统 bash 3.2 也不支持 nameref，三行文本让调用方自己 sed 取，跟仓库
+  # 里其它地方的风格一致。
+  printf '%s\n%s\n%s\n' "$tmpdir" "$repo_real" "$resolved"
+}
+
+cmd_import_github() {
+  [ "$#" -ge 1 ] || { usage >&2; return 2; }
+  local url="$1"
+  shift
+  # 从浏览器地址栏/聊天窗口/文档编辑器复制的链接经常带两类肉眼看不出的
+  # 问题字符：(a) 零宽空格、NBSP、孤立 \r 这类纯噪音，删掉就好；(b) 排版
+  # 软件自动替换出来的"长得像 ASCII 但不是"的标点——最典型的是不断行连
+  # 字符 U+2011（跟连字符 - 肉眼完全一样），一段 owner-repo 里的连字符被
+  # 换成它之后，如果直接把非 ASCII 字节整段删掉（第一版就是这么写的），
+  # "vercel‑labs" 会被删成完全不同的 "vercellabs"——git clone 一个根本不
+  # 存在的仓库，报错还让人摸不着头脑。所以必须先把这类"形似 ASCII"的标
+  # 点换回真正的 ASCII 字符，再删剩下真正的不可见噪音，顺序不能反。
+  url="$(printf '%s' "$url" | sed \
+    -e 's/‐/-/g; s/‑/-/g; s/‒/-/g; s/–/-/g; s/—/-/g; s/−/-/g' \
+    -e 's/／/\//g; s/：/:/g; s/．/./g; s/－/-/g; s/＿/_/g')"
+  # tr 的字节范围语法依赖 C locale，不加 LC_ALL=C 时系统 UTF-8 locale 会
+  # 把多字节字符当一个整体处理，range 匹配会静默失效（实测过，不是保险
+  # 起见）；这一步只删纯噪音，上面 sed 那一步已经把有意义的标点转换完了。
+  url="$(printf '%s' "$url" | LC_ALL=C tr -d '\000-\037\177-\377')"
+  local path_arg="" ref_arg=""
+  local -a rest=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --path)
+        [ "$#" -ge 2 ] || { usage >&2; return 2; }
+        path_arg="$2"
+        shift 2
+        ;;
+      --ref)
+        [ "$#" -ge 2 ] || { usage >&2; return 2; }
+        ref_arg="$2"
+        shift 2
+        ;;
+      --display-name|--alias)
+        [ "$#" -ge 2 ] || { usage >&2; return 2; }
+        rest+=("$1" "$2")
+        shift 2
+        ;;
+      --activate|--replace|--apply)
+        rest+=("$1")
+        shift
+        ;;
+      *) usage >&2; return 2 ;;
+    esac
+  done
+
+  local owner repo tree_ref="" tree_path=""
+  if [[ "$url" =~ ^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(\.git)?/?$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+  elif [[ "$url" =~ ^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/tree/([^/]+)/(.+)$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+    tree_ref="${BASH_REMATCH[3]}"
+    tree_path="${BASH_REMATCH[4]}"
+  else
+    printf '只支持 https://github.com/<owner>/<repo> 或 https://github.com/<owner>/<repo>/tree/<ref>/<子路径> 这两种链接：%s\n' "$url" >&2
+    return 2
+  fi
+
+  local ref="${ref_arg:-$tree_ref}"
+  local subpath="${path_arg:-$tree_path}"
+  case "$subpath" in
+    /*|*..*)
+      printf -- '--path 不能是绝对路径也不能包含 ..：%s\n' "$subpath" >&2
+      return 2
+      ;;
+  esac
+
+  # 这台机器的系统 /bin/bash（3.2）测过 trap ... RETURN 在这个函数的调用
+  # 形状下不可靠（预演分支实测没触发，会在 $TMPDIR 底下攒垃圾）——仓库
+  # 里其它地方本来也都不用 trap，克隆本身和这里一样改成每个 return 前
+  # 手动清一次，显式、可验证，不依赖这个老 bash 版本的行为。
+  local clone_out tmpdir repo_real resolved
+  clone_out="$(clone_github_repo "$owner" "$repo" "$ref" "$subpath")" || return 1
+  tmpdir="$(printf '%s\n' "$clone_out" | sed -n '1p')"
+  repo_real="$(printf '%s\n' "$clone_out" | sed -n '2p')"
+  resolved="$(printf '%s\n' "$clone_out" | sed -n '3p')"
+
+  if [ ! -f "$resolved/SKILL.md" ]; then
+    printf '%s 下没有 SKILL.md。' "${subpath:-仓库根目录}" >&2
+    # 旧版本只认"skills/<name>/SKILL.md"这一层扁平结构，写死去看
+    # "$repo_real/skills"下面的一级子目录。像 mattpocock/skills 这种按
+    # 分类多套一层的仓库（skills/<分类>/<name>/SKILL.md）会踩坑：选了
+    # "skills/productivity"这个分类目录本身（它自己没有 SKILL.md），
+    # 于是又去看写死的"$repo_real/skills"，原样把同一份分类列表再报一
+    # 遍——用户看到的是自己刚试过的路径又出现在"建议"里，绕不出去。改成
+    # 直接从当前尝试的 resolved 往下找真正挂着 SKILL.md 的目录（最多找 4
+    # 层，够覆盖"扁平"和"带一层分类"两种常见结构），建议永远是"在你已经
+    # 走到的地方往下一层"，不会绕回原地。
+    local skill_dirs
+    skill_dirs="$(find "$resolved" -mindepth 1 -maxdepth 4 -iname 'SKILL.md' -exec dirname {} \; 2>/dev/null | sort)"
+    if [ -n "$skill_dirs" ]; then
+      printf '这个仓库像是多 Skill 仓库，试试 --path <子目录>，比如：\n' >&2
+      printf '%s\n' "$skill_dirs" | while IFS= read -r d; do
+        printf '    --path %s\n' "${d#$repo_real/}" >&2
+      done
+    else
+      printf '\n' >&2
+    fi
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  # "预览"不能只说"这是只读的"，得让人看到具体要引入什么内容——声明的
+  # name/description，以及带没带可执行脚本——再决定要不要继续。
+  local decl_name decl_desc script_files clone_url ref_note
+  decl_name="$(skill_declared_name "$resolved" 2>/dev/null || true)"
+  decl_desc="$(skill_description "$resolved" 2>/dev/null || true)"
+  script_files="$(find "$resolved" -type f \( -name '*.sh' -o -name '*.js' -o -name '*.mjs' -o -name '*.cjs' -o -name '*.py' -o -name '*.rb' \) 2>/dev/null || true)"
+  clone_url="https://github.com/$owner/$repo.git"
+  ref_note=""
+  [ -n "$ref" ] && ref_note="（ref: ${ref}）"
+  printf -- '--- 来源预览 ---\n'
+  printf '仓库：%s%s\n' "$clone_url" "$ref_note"
+  printf '子路径：%s\n' "${subpath:-（仓库根目录）}"
+  printf '声明 name：%s\n' "${decl_name:-（缺失）}"
+  printf '声明 description：%s\n' "${decl_desc:-（缺失）}"
+  if [ -n "$script_files" ]; then
+    printf '带可执行脚本（%s 个），确认前建议过一眼：\n' "$(printf '%s\n' "$script_files" | grep -c .)"
+    printf '%s\n' "$script_files" | sed "s|^$resolved/||; s/^/    /"
+  else
+    printf '不含可执行脚本\n'
+  fi
+  printf -- '----------------\n'
+
+  # 空数组直接展开 "${rest[@]}" 在这台机器的系统 /bin/bash（3.2，macOS
+  # 自带的老版本，跟 Homebrew 装的新版 bash 不是同一个）在 set -u 下会报
+  # unbound variable——先判个数再决定要不要展开，绕开这个老 bash 的坑。
+  # 这里还接住 cmd_import 的退出码（而不是让 set -e 直接终止），是为了
+  # 保证不管 cmd_import 成功与否，$tmpdir 都会被清理，再把原始退出码传
+  # 出去，调用方看到的失败/成功语义跟直接调用 cmd_import 完全一致。
+  local rc=0
+  if [ "${#rest[@]}" -gt 0 ]; then
+    cmd_import "$resolved" "${rest[@]}" || rc=$?
+  else
+    cmd_import "$resolved" || rc=$?
+  fi
+
+  # 真正落地成功（带了 --apply 且 cmd_import 没报错）才登记来源，预演
+  # 分支不登记——登记的"基准哈希"必须是仓库里实际存在的内容，不能是还
+  # 没写进去的预演结果。登记失败（比如 state/ 目录权限问题）不影响这次
+  # 导入本身已经成功这件事，只 best-effort，不改变返回码。
+  local applied="no" r
+  if [ "$rc" -eq 0 ] && [ "${#rest[@]}" -gt 0 ]; then
+    for r in "${rest[@]}"; do
+      [ "$r" = "--apply" ] && applied="yes"
+    done
+  fi
+  if [ "$applied" = "yes" ]; then
+    record_provenance "$decl_name" "https://github.com/$owner/$repo" "$subpath" "$ref" || true
+  fi
+
+  rm -rf "$tmpdir"
+  return "$rc"
+}
+
+resolve_provenance_file() {
+  printf '%s\n' "$SKILL_LIBRARY_ROOT/state/provenance.tsv"
+}
+
+# 来源登记：id \t url \t path \t ref \t imported_hash \t imported_at，供
+# check-updates 判断"本地是否还是登记时的样子"。跟 write_alias_row 一样
+# 的 upsert 写法：先把这个 id 的旧行滤掉，再把新行接上去，整体走
+# mktemp+mv 原子替换。
+write_provenance_row() {
+  local file="$1" id="$2" url="$3" path="$4" ref="$5" hash="$6" at="$7" tmp
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  tmp="$(mktemp "$(dirname "$file")/.provenance.tsv.XXXXXX")" || return 1
+  if [ -f "$file" ]; then
+    awk -F '\t' -v id="$id" '$1 != id' "$file" > "$tmp"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$url" "$path" "$ref" "$hash" "$at" >> "$tmp"
+  mv "$tmp" "$file"
+}
+
+provenance_row() {
+  local file="$1" id="$2"
+  [ -f "$file" ] || return 0
+  awk -F '\t' -v id="$id" '$1 == id { print; exit }' "$file"
+}
+
+# 记一次来源：把 id 当前的仓库内容哈希当成"基准版本"——check-updates 靠
+# 对比这个哈希和当前哈希是否一致，判断"本地还是干净的、能跟上游比"还是
+# "已经被手动改过、不能贸然覆盖"。import-github 落地成功后自动调用；
+# track-source 给早于这套机制就存在的 skill 补登记时也调用它，只是基准
+# 版本变成"补登记那一刻的当前内容"，不是真正的原始导入版本——没法追溯
+# 更早的版本，只能退而求其次从补登记这一刻开始追踪。
+record_provenance() {
+  local id="$1" url="$2" path="$3" ref="$4" file hash at
+  file="$(resolve_provenance_file)"
+  hash="$(directory_content_hash "$SKILL_LIBRARY_ROOT/skills/$id" 2>/dev/null || true)"
+  [ -n "$hash" ] || return 1
+  at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  write_provenance_row "$file" "$id" "$url" "$path" "$ref" "$hash" "$at"
+}
+
+cmd_track_source() {
+  local id="$1" url="$2" path="$3" ref="$4" apply="$5"
+  local path_note="" ref_note=""
+  real_dir "$SKILL_LIBRARY_ROOT/skills/$id" >/dev/null 2>&1 || {
+    printf '仓库中没有 %s，无法登记来源；不知道 id 就先 skillctl status\n' "$id" >&2
+    return 1
+  }
+  case "$url" in
+    https://github.com/*) ;;
+    *) printf 'url 必须是 https://github.com/... 开头：%s\n' "$url" >&2; return 1 ;;
+  esac
+  case "$path" in
+    /*|*..*) printf -- '--path 不能是绝对路径也不能包含 ..：%s\n' "$path" >&2; return 1 ;;
+  esac
+  [ -n "$path" ] && path_note="（子路径 ${path}）"
+  [ -n "$ref" ] && ref_note="（ref: ${ref}）"
+
+  # 登记前先跟上游比一眼：如果这时候本地内容已经跟上游不一样，说明在
+  # 补登记之前它就已经被改过了——不是"干净、当下等于某个上游版本"的起
+  # 点。这种情况下 check-updates 以后会一直报"有更新"，但那只表示"内容
+  # 不同"，不代表"落后于上游、可以放心覆盖"（本地可能反而是领先/更丰富
+  # 的一方，直接 --replace 会把这些改动冲掉）。这个提醒必须在登记这一刻
+  # 就说清楚，不能指望以后 check-updates 的措辞自己讲明白这个区别。
+  local -a peek_args=("$url")
+  [ -n "$path" ] && peek_args+=(--path "$path")
+  [ -n "$ref" ] && peek_args+=(--ref "$ref")
+  local peek_out
+  peek_out="$(cmd_import_github "${peek_args[@]}" 2>&1)" || true
+  if printf '%s' "$peek_out" | grep -q '如需替换请使用'; then
+    printf '注意：%s 现在的内容已经跟上游不一样了（很可能是登记前就手动改过）。登记之后 check-updates 会一直显示"有更新"，但那只表示"内容不同"，不代表"落后于上游、可以放心覆盖"——千万别看到"有更新"就直接 --replace，会把本地的修改冲掉，想更新前请先自己对比差异。\n' "$id"
+  fi
+
+  if [ "$apply" != "yes" ]; then
+    printf '[预演] 登记 %s -> %s%s%s（基准版本 = 当前仓库内容）\n' "$id" "$url" "$path_note" "$ref_note"
+    return 0
+  fi
+  record_provenance "$id" "$url" "$path" "$ref" || { printf '登记失败：%s\n' "$id" >&2; return 1; }
+  printf '[已登记] %s -> %s%s%s\n' "$id" "$url" "$path_note" "$ref_note"
+}
+
+# 对每个登记过来源的 id：先比对当前内容哈希跟登记时的基准哈希，不一致
+# 说明本地已经改过，直接跳过、不联网查上游（避免"能不能覆盖"判断出错，
+# 也省一次不必要的 clone）；一致的话才去跟上游比，直接复用
+# cmd_import_github 自己的预演输出（它本来就会判断"内容相同"还是"不
+# 同"），不重新写一遍 clone+哈希比对的逻辑。
+cmd_check_updates_one() {
+  local id="$1" file row url path ref imported_hash current_hash out
+  file="$(resolve_provenance_file)"
+  row="$(provenance_row "$file" "$id")"
+  if [ -z "$row" ]; then
+    printf '%s\t未登记来源（用 skillctl track-source 补登记，或本来就不是从 GitHub 导入的）\n' "$id"
+    return 0
+  fi
+  # 不用 IFS=tab + read 拆字段——bash 的 read 把 tab 当成"IFS 空白字符"，
+  # 连续分隔符（也就是这行中间 ref 为空时的两个相邻 tab）会被合并成一个，
+  # 导致空字段被跳过、后面的字段全部错位一格（实测过：ref 从没传过的
+  # 正常情况下会直接错位）。cut 按位置取字段不做这种合并，空字段该是空
+  # 还是空。
+  url="$(printf '%s' "$row" | cut -f2)"
+  path="$(printf '%s' "$row" | cut -f3)"
+  ref="$(printf '%s' "$row" | cut -f4)"
+  imported_hash="$(printf '%s' "$row" | cut -f5)"
+  current_hash="$(directory_content_hash "$SKILL_LIBRARY_ROOT/skills/$id" 2>/dev/null || true)"
+  if [ -z "$current_hash" ]; then
+    printf '%s\t仓库中读不到这个 id，跳过\n' "$id"
+    return 0
+  fi
+  if [ "$current_hash" != "$imported_hash" ]; then
+    printf '%s\t本地内容已改动（跟登记时不一致），跳过上游对比，不会误判覆盖\n' "$id"
+    return 0
+  fi
+
+  local -a check_args=("$url")
+  [ -n "$path" ] && check_args+=(--path "$path")
+  [ -n "$ref" ] && check_args+=(--ref "$ref")
+  # cmd_import_github 预演到"内容不同"时会 return 1（这是它正常的、故意
+  # 的行为——检查是否有更新本来就期待经常撞到这个分支），但在 set -e 下，
+  # 裸的 var="$(失败的命令)" 赋值会让整个脚本直接退出，不会走到下面这些
+  # grep 分支——用 || true 接住，只关心它打印了什么，不关心退出码本身。
+  out="$(cmd_import_github "${check_args[@]}" 2>&1)" || true
+  if printf '%s' "$out" | grep -q '内容相同，无需变更'; then
+    printf '%s\t已是最新\n' "$id"
+  elif printf '%s' "$out" | grep -q '如需替换请使用'; then
+    printf '%s\t有更新，可用 skillctl import-github %s' "$id" "$url"
+    [ -n "$path" ] && printf ' --path %s' "$path"
+    [ -n "$ref" ] && printf ' --ref %s' "$ref"
+    printf ' --replace --apply 更新\n'
+  else
+    printf '%s\t检查失败：%s\n' "$id" "$(printf '%s' "$out" | tail -1)"
+  fi
+}
+
+# 组内的 id 共享同一次 clone_github_repo（同一个 url+ref 已经克隆过了），
+# 从这份克隆里各自定位自己的 --path 子目录、跟仓库里现在的内容比哈希。
+# clean_file 是 cmd_check_updates 传来的"本地未改动、待联网核实"名单，
+# 4 列：id / url / ref / path。
+check_updates_group() {
+  local group_url="$1" group_ref="$2" clean_file="$3"
+  local owner repo
+  if [[ "$group_url" =~ ^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(\.git)?/?$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+  else
+    # 理论上不会发生（url 落地前都在 track-source/import-github 里校验
+    # 过），但真出现的话把这一组每个 id 都标成检查失败，不能让整个
+    # check-updates 崩掉。
+    awk -F '\t' -v u="$group_url" -v r="$group_ref" '$2 == u && $3 == r { printf "%s\t检查失败：登记的 url 格式不对：%s\n", $1, u }' "$clean_file"
+    return 0
+  fi
+
+  # clone_github_repo 的错误原因是打到 stderr 的（"需要 git，未检测到"、
+  # "克隆失败：...检查仓库是否存在/ref是否正确/网络是否可达"等），之前
+  # 这里直接吞掉、统一报"克隆上游仓库失败"——诊断不出到底是什么原因，
+  # 排查全靠猜。现在单独接一份 stderr，失败时把最后一行原样带出来。
+  local clone_out clone_err clone_rc=0 tmpdir repo_real
+  clone_err="$(mktemp "${TMPDIR:-/tmp}/skillctl-check-updates-err.XXXXXX")" || {
+    awk -F '\t' -v u="$group_url" -v r="$group_ref" '$2 == u && $3 == r { printf "%s\t检查失败：创建临时文件失败\n", $1 }' "$clean_file"
+    return 0
+  }
+  clone_out="$(clone_github_repo "$owner" "$repo" "$group_ref" "" 2>"$clone_err")" || clone_rc=$?
+  if [ "$clone_rc" -ne 0 ]; then
+    local msg
+    msg="$(tail -1 "$clone_err" 2>/dev/null)"
+    rm -f "$clone_err"
+    [ -n "$msg" ] || msg="克隆失败（原因不明）"
+    awk -F '\t' -v u="$group_url" -v r="$group_ref" -v m="$msg" '$2 == u && $3 == r { printf "%s\t检查失败：%s\n", $1, m }' "$clean_file"
+    return 0
+  fi
+  rm -f "$clone_err"
+  tmpdir="$(printf '%s\n' "$clone_out" | sed -n '1p')"
+  repo_real="$(printf '%s\n' "$clone_out" | sed -n '2p')"
+
+  local line each_id path upstream_dir upstream_hash current_hash
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    each_id="$(printf '%s' "$line" | cut -f1)"
+    path="$(printf '%s' "$line" | cut -f4)"
+    if [ -n "$path" ]; then
+      upstream_dir="$(real_dir "$repo_real/$path" 2>/dev/null || true)"
+    else
+      upstream_dir="$repo_real"
+    fi
+    if [ -z "$upstream_dir" ] || ! path_is_ancestor "$repo_real" "$upstream_dir"; then
+      printf '%s\t检查失败：子路径不存在或越界\n' "$each_id"
+      continue
+    fi
+    upstream_hash="$(directory_content_hash "$upstream_dir" 2>/dev/null || true)"
+    current_hash="$(directory_content_hash "$SKILL_LIBRARY_ROOT/skills/$each_id" 2>/dev/null || true)"
+    if [ -z "$upstream_hash" ] || [ -z "$current_hash" ]; then
+      printf '%s\t检查失败：读取内容哈希失败\n' "$each_id"
+    elif [ "$upstream_hash" = "$current_hash" ]; then
+      printf '%s\t已是最新\n' "$each_id"
+    else
+      printf '%s\t有更新，可用 skillctl import-github %s' "$each_id" "$group_url"
+      [ -n "$path" ] && printf ' --path %s' "$path"
+      [ -n "$group_ref" ] && printf ' --ref %s' "$group_ref"
+      printf ' --replace --apply 更新\n'
+    fi
+  done < <(awk -F '\t' -v u="$group_url" -v r="$group_ref" '$2 == u && $3 == r' "$clean_file")
+
+  rm -rf "$tmpdir"
+}
+
+cmd_check_updates() {
+  local id="$1" file
+  file="$(resolve_provenance_file)"
+  if [ -n "$id" ]; then
+    cmd_check_updates_one "$id"
+    return 0
+  fi
+  if [ ! -f "$file" ]; then
+    printf '还没有任何 skill 登记过来源（import-github 导入后自动登记，或用 skillctl track-source 给已有的补登记）\n'
+    return 0
+  fi
+
+  # 先把每个 id 是否本地已改动判断完（纯本地读取，不联网，很快）；干净
+  # 的才值得真的联网核实，写进一个临时文件按 (url, ref) 分组——同一个
+  # 仓库/ref 登记了好几个 skill 时（比如整套 Superpowers 14 个都指向
+  # obra/superpowers）以前是每个 id 各自 clone 一遍，15 个里 14 个撞同一
+  # 个仓库时实测要 50+ 秒，长到面板那次点击直接超时/连接被打断；分组后
+  # 同一个仓库只 clone 一次。
+  local clean_file each_id row url path ref imported_hash current_hash
+  clean_file="$(mktemp "${TMPDIR:-/tmp}/skillctl-check-updates.XXXXXX")" || {
+    printf '创建临时文件失败\n' >&2
+    return 1
+  }
+  : > "$clean_file"
+  while IFS= read -r each_id; do
+    [ -n "$each_id" ] || continue
+    row="$(provenance_row "$file" "$each_id")"
+    url="$(printf '%s' "$row" | cut -f2)"
+    path="$(printf '%s' "$row" | cut -f3)"
+    ref="$(printf '%s' "$row" | cut -f4)"
+    imported_hash="$(printf '%s' "$row" | cut -f5)"
+    current_hash="$(directory_content_hash "$SKILL_LIBRARY_ROOT/skills/$each_id" 2>/dev/null || true)"
+    if [ -z "$current_hash" ]; then
+      printf '%s\t仓库中读不到这个 id，跳过\n' "$each_id"
+    elif [ "$current_hash" != "$imported_hash" ]; then
+      printf '%s\t本地内容已改动（跟登记时不一致），跳过上游对比，不会误判覆盖\n' "$each_id"
+    else
+      printf '%s\t%s\t%s\t%s\n' "$each_id" "$url" "$ref" "$path" >> "$clean_file"
+    fi
+  done < <(awk -F '\t' '{ print $1 }' "$file")
+
+  if [ ! -s "$clean_file" ]; then
+    rm -f "$clean_file"
+    return 0
+  fi
+
+  local group_key group_url group_ref
+  while IFS= read -r group_key; do
+    [ -n "$group_key" ] || continue
+    group_url="$(printf '%s' "$group_key" | cut -f1)"
+    group_ref="$(printf '%s' "$group_key" | cut -f2)"
+    check_updates_group "$group_url" "$group_ref" "$clean_file"
+  done < <(awk -F '\t' '{ print $2 "\t" $3 }' "$clean_file" | sort -u)
+
+  rm -f "$clean_file"
+}
+
 # 只读操作，不需要 --apply：只是把仓库里已有内容原样拷一份到仓库外，不改
 # 仓库、不改 catalog、不改软链状态。导出天然是"干净"的——skillctl 自己的
-# 登记信息（catalog.tsv 的行、archive manifest、state/ 下的记录）本来就存在
+# 登记信息（catalog.tsv 的行、state/ 下的记录）本来就存在
 # 仓库层面，从不写进 Skill 自己的目录里，所以只要 ditto 这个目录本身，输出
 # 就已经只含 SKILL.md 和内容文件，不用额外过滤。
 cmd_export() {
@@ -1085,6 +1508,58 @@ detect_status_for_row() {
   printf '未检测到\n'
 }
 
+# 从人类可读的平台名生成一个能当 adapter id 用的 slug：转小写、非字母
+# 数字的整段换成一个连字符、去掉首尾连字符。跟 valid_skill_name 用的
+# 字符集一致（小写字母数字+连字符），自定义平台的 id 和 skill id 走
+# 同一套约定，不会在别处校验时被拒。
+slugify_tool_id() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+# 注册一个用户自己填的自定义平台：只要平台名 + 技能目录路径，写一行到
+# tools.tsv 里，剩下的 detect/connect/disconnect/面板展示全都是数据驱动
+# 的，不用为"自定义"这个概念单独写一套逻辑。verification 字段故意写死
+# 成字面量 "unverified"（cmd_tools_connect 已有的、之前一直没被触发过
+# 的那个 --allow-unverified 门槛，正好用在这——skillctl 不认识这个用户
+# 自己填的平台，第一次连接强制要求显式确认）。
+cmd_add_custom_tool() {
+  local display_name="$1" dir_input="$2" apply="$3"
+  local id adapters_file global_dir project_dir
+
+  [ -n "$display_name" ] || { printf '平台名称不能为空\n' >&2; return 1; }
+  [ -n "$dir_input" ] || { printf '技能目录路径不能为空\n' >&2; return 1; }
+
+  id="$(slugify_tool_id "$display_name")"
+  valid_skill_name "$id" || {
+    printf '平台名称转成 id 后不合法（%s）：至少要包含一个字母或数字\n' "$id" >&2
+    return 1
+  }
+
+  adapters_file="$(resolve_adapters_file)"
+  [ -f "$adapters_file" ] || { printf '软件适配器配置不存在：%s\n' "$adapters_file" >&2; return 1; }
+  if [ -n "$(adapter_row "$id" "$adapters_file")" ]; then
+    printf '已存在同 id 的平台：%s（换个名字，或者这个平台可能已经注册过了）\n' "$id" >&2
+    return 1
+  fi
+
+  case "$dir_input" in
+    "~"|"~/"*|/*) global_dir="$dir_input" ;;
+    *) printf '技能目录路径必须是绝对路径或 ~ 开头：%s\n' "$dir_input" >&2; return 1 ;;
+  esac
+  case "$global_dir" in
+    "~/"*) project_dir="${global_dir#\~/}" ;;
+    *) project_dir="" ;;
+  esac
+
+  if [ "$apply" != "yes" ]; then
+    printf '[预演] 注册自定义平台 %s（id: %s）-> %s\n' "$display_name" "$id" "$global_dir"
+    return 0
+  fi
+
+  printf '%s\t%s\tlink\t%s\t%s\t\t%s\tunverified\n' "$id" "$display_name" "$global_dir" "$project_dir" "$display_name" >> "$adapters_file"
+  printf '[已注册] %s -> %s（首次连接需要 skillctl tools connect %s --allow-unverified --apply）\n' "$display_name" "$global_dir" "$id"
+}
+
 cmd_tools_detect() {
   local adapters_file id display mode global_dir _project_dir cli_command app_name verification status mode_label
   adapters_file="$(resolve_adapters_file)"
@@ -1171,6 +1646,13 @@ cmd_dashboard_open() {
   local html="$SKILL_LIBRARY_ROOT/dashboard/index.html"
   [ -f "$html" ] || { printf '面板尚未生成，请先运行 skillctl dashboard build --apply\n' >&2; return 1; }
   open "$html"
+}
+
+cmd_dashboard_serve() {
+  local server_script="$SCRIPT_DIR/dashboard-server.py"
+  [ -f "$server_script" ] || { printf '面板服务脚本不存在：%s\n' "$server_script" >&2; return 1; }
+  command -v python3 >/dev/null 2>&1 || { printf '需要 python3，本机未找到\n' >&2; return 1; }
+  SKILL_LIBRARY_ROOT="$SKILL_LIBRARY_ROOT" python3 "$server_script"
 }
 
 # 判断一个软链是否"归属仓库"：把软链一路解析到最终真实路径，只要落在
@@ -1401,16 +1883,39 @@ doctor_check_broken_links() {
 }
 
 # 断链检查（doctor_check_broken_links）是"货架上的软链指向仓库里已经不存在
-# 的内容"；这里反过来查"货架上有真实目录（不是软链），仓库根本不认识"——
-# 典型场景是直接让 AI 工具把新技能装到 ~/.agents/skills 或 ~/.claude/skills
-# 这类原生扫描目录，而不是走 skillctl import，内容看似"装好了"，实际上
-# 仓库和面板都不知道它存在。只查一层，不递归；只认"目录里有 SKILL.md"的
-# 才算数，避免把货架下面的杂散文件/临时目录也报进来。
+# 的内容"；这里反过来查两类"仓库根本不认识"的情况：
+#   1. 货架上有真实目录（不是软链）——典型场景是直接让 AI 工具把新技能装到
+#      ~/.agents/skills 或 ~/.claude/skills 这类原生扫描目录，而不是走
+#      skillctl import。
+#   2. 货架上有软链接，但指向的不是仓库（$SKILL_LIBRARY_ROOT/skills 之下），
+#      而是外部某个目录——典型场景是接管 skillctl 之前手动建的裸链接，内容
+#      看似"装好了"，实际上从没走过 import，仓库和面板都不知道它存在。
+# 两种情况都只查一层，不递归；只认"目录里有 SKILL.md"的才算数，避免把货架
+# 下面的杂散文件/临时目录也报进来。
 doctor_check_shelf_orphans_dir() {
-  local dir="$1" entry id declared display
+  local dir="$1" entry resolved id declared display
   [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
   for entry in "$dir"/*; do
-    [ -d "$entry" ] && [ ! -L "$entry" ] || continue
+    if [ -L "$entry" ]; then
+      [ -d "$entry" ] || continue
+      resolved="$(cd "$entry" 2>/dev/null && pwd -P)" || continue
+      case "$resolved" in
+        "$SKILL_LIBRARY_ROOT"/skills/*) continue ;;
+      esac
+      [ -f "$resolved/SKILL.md" ] || continue
+      declared="$(skill_declared_name "$resolved" 2>/dev/null || true)"
+      id="$(basename "$entry")"
+      if [ -n "$declared" ]; then
+        [ -n "$(catalog_entry "$declared")" ] && continue
+      else
+        [ -n "$(catalog_entry "$id")" ] && continue
+      fi
+      display="${declared:-$id}"
+      doctor_report warn "货架目录 $dir 下的 $display 是指向仓库之外的裸链接（-> ${resolved}），仓库和面板都不认识它" \
+        "确认内容无误后 skillctl import \"$resolved\" --activate --apply 收编进仓库，再把这条裸链接换成 skillctl 建的软链"
+      continue
+    fi
+    [ -d "$entry" ] || continue
     [ -f "$entry/SKILL.md" ] || continue
     declared="$(skill_declared_name "$entry" 2>/dev/null || true)"
     id="$(basename "$entry")"
@@ -1585,7 +2090,7 @@ doctor_check_duplicate_ids() {
     while IFS= read -r id; do
       [ -n "$id" ] || continue
       doctor_report fail "catalog 中 id 重复：$id" \
-        "检查是否有两个 Skill 目录的 SKILL.md 声明了相同的 name 字段，改成唯一值后重跑 build-catalog.sh --apply（或任意 import/archive/restore 会自动重建）"
+        "检查是否有两个 Skill 目录的 SKILL.md 声明了相同的 name 字段，改成唯一值后重跑 build-catalog.sh --apply（或任意 import 会自动重建）"
     done <<< "$dupes"
   else
     doctor_report ok "catalog 中没有重复的 Skill id"
@@ -1599,7 +2104,7 @@ doctor_check_catalog_disk_consistency() {
     if [ ! -d "$SKILL_LIBRARY_ROOT/$relative_path" ]; then
       found=1
       doctor_report fail "catalog 记录了 ${id}，但仓库目录不存在：$SKILL_LIBRARY_ROOT/$relative_path" \
-        "运行 build-catalog.sh --apply 重建目录（或执行任意 import/archive/restore 会自动刷新）"
+        "运行 build-catalog.sh --apply 重建目录（或执行任意 import 会自动刷新）"
     fi
   done < "$CATALOG_FILE"
 
@@ -1858,20 +2363,22 @@ scene_help() {
 skillctl —— 多工具共用的 Skill 仓库管理
 
 常用场景：
-  skillctl status —— 看现状：每个 Skill 的激活/归档/冲突状态
+  skillctl status —— 看现状：每个 Skill 的激活/冲突状态
   skillctl profile use <场景包名> --apply —— 切场景包（core/aipm/frameflow/stock/lark）
   skillctl activate <id> --apply —— 激活一个 Skill
   skillctl deactivate <id> --apply —— 停用一个 Skill
   skillctl import <绝对目录> --apply —— 把仓库外的 Skill 收进仓库
-  skillctl archive <id> --apply —— 下架（软删除，能用 restore 恢复）
+  skillctl import-github <GitHub URL> --apply —— 从 GitHub 仓库直接导入（多 Skill 仓库配 --path 子路径）
+  skillctl check-updates [id] —— 看登记过来源的 Skill 有没有上游更新，只读
   skillctl tools detect —— 看哪些工具已装/已连接
   skillctl tools connect <工具id> --apply —— 把当前激活集合同步给某个工具
   skillctl doctor —— 体检：断链/工具检测/一致性等，只读
   skillctl lint —— 检查 Skill 内容质量：frontmatter/description 长度/触发词重叠，只读
   skillctl dashboard build --apply && skillctl dashboard open —— 生成并打开本地只读面板
+  skillctl dashboard serve —— 起本地服务打开面板，激活/停用/删除按钮点击即生效（不用再复制命令到终端）
   skillctl eject --apply —— 彻底退出这套软链管理（不可逆，先看预演）
 
-其他：skillctl list ・ search <关键词> ・ restore <id> --apply
+其他：skillctl list ・ search <关键词>
 所有会改状态的命令都默认只预演，不带 --apply 不会真正执行；完整参数说明：skillctl help
 EOF
 }
@@ -1893,17 +2400,20 @@ skillctl —— 多工具共用的 Skill 仓库管理
   skillctl doctor
   skillctl lint
   skillctl export <id> [--output <绝对路径>]        打包成干净拷贝，默认输出到 ~/Desktop/skill-export-<id>/
+  skillctl check-updates [id]        不给 id 就检查所有登记过来源的；本地内容跟登记时不一致（说明手动改过）的会跳过，不联网比对
 
 会改动状态的命令（默认只预演，加 --apply 才真正执行）：
   skillctl activate <id> [--apply]
   skillctl deactivate <id> [--apply]
   skillctl profile use <场景包名> [--apply]
   skillctl import <绝对目录> [--display-name 名称] [--alias 名称] [--activate] [--replace] [--apply]
-  skillctl archive <id> [--apply]
-  skillctl restore <id> [--archive-id 归档ID] [--reactivate] [--apply]
+  skillctl import-github <GitHub URL> [--path 子路径] [--ref 分支/tag] [--display-name 名称] [--alias 名称] [--activate] [--replace] [--apply]
+  skillctl track-source <id> <GitHub URL> [--path 子路径] [--ref 分支/tag] [--apply]        给已有 Skill 补登记来源（基准版本 = 登记那一刻的当前内容）
   skillctl tools connect <工具id> [--allow-unverified] [--prune] [--apply]
+  skillctl tools add <平台名称> <技能目录路径> [--apply]
   skillctl tools disconnect <工具id> [--apply]
   skillctl dashboard build [--apply]
+  skillctl dashboard serve         起本地服务，面板上的操作按钮直接生效
   skillctl eject [--apply]        彻底退出这套软链管理，不可逆
 
 实验性（行为不变，代码保留，不进常用场景速查）：
@@ -2043,6 +2553,44 @@ case "$command" in
     # 不然干净账户走一遍 Quickstart 第一步就卡死。
     cmd_import "$@"
     ;;
+  import-github)
+    [ "$#" -ge 1 ] || usage_error "用法：skillctl import-github <GitHub URL> [--path 子路径] [--ref 分支/tag] [--display-name 名称] [--alias 名称] [--activate] [--replace] [--apply]"
+    # 跟 import 一样，故意不在这里 require_catalog：cmd_import_github 最终
+    # 会落到 cmd_import，同样得能在全新安装、catalog.tsv 还不存在时跑通。
+    cmd_import_github "$@"
+    ;;
+  track-source)
+    [ "$#" -ge 2 ] || usage_error "用法：skillctl track-source <id> <GitHub URL> [--path 子路径] [--ref 分支/tag] [--apply]"
+    id="$1"
+    url="$2"
+    shift 2
+    track_path=""
+    track_ref=""
+    apply="no"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --path)
+          [ "$#" -ge 2 ] || usage_error "--path 后面需要跟子路径"
+          track_path="$2"
+          shift 2
+          ;;
+        --ref)
+          [ "$#" -ge 2 ] || usage_error "--ref 后面需要跟分支或 tag"
+          track_ref="$2"
+          shift 2
+          ;;
+        --apply) apply="yes"; shift ;;
+        *) usage_error "未知参数：$1；track-source 支持 --path/--ref/--apply" ;;
+      esac
+    done
+    require_catalog
+    cmd_track_source "$id" "$url" "$track_path" "$track_ref" "$apply"
+    ;;
+  check-updates)
+    [ "$#" -eq 0 ] || [ "$#" -eq 1 ] || usage_error "用法：skillctl check-updates [id]"
+    require_catalog
+    cmd_check_updates "${1:-}"
+    ;;
   export)
     [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || usage_error "用法：skillctl export <id> [--output <绝对路径>]；不知道 id 就先 skillctl status 或 skillctl search <关键词>"
     id="$1"
@@ -2054,44 +2602,25 @@ case "$command" in
     require_catalog
     cmd_export "$id" "$output"
     ;;
-  archive)
-    [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || usage_error "用法：skillctl archive <id> [--apply]；不知道 id 就先 skillctl status 看当前有哪些"
-    id="$1"
-    apply="no"
-    if [ "$#" -eq 2 ]; then
-      [ "$2" = "--apply" ] || usage_error "未知参数：$2；archive 只接受结尾的 --apply"
-      apply="yes"
-    fi
-    require_catalog
-    cmd_archive "$id" "$apply"
-    ;;
-  restore)
-    [ "$#" -ge 1 ] || usage_error "用法：skillctl restore <id> [--archive-id 归档ID] [--reactivate] [--apply]"
-    id="$1"
-    shift
-    restore_archive_id=""
-    reactivate="no"
-    apply="no"
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --archive-id)
-          [ "$#" -ge 2 ] || usage_error "--archive-id 后面需要跟归档 ID（形如 20260814-124500-ab12cd34）"
-          restore_archive_id="$2"
-          shift 2
-          ;;
-        --reactivate) reactivate="yes"; shift ;;
-        --apply) apply="yes"; shift ;;
-        *) usage_error "未知参数：$1；restore 支持 --archive-id/--reactivate/--apply" ;;
-      esac
-    done
-    require_catalog
-    cmd_restore "$id" "$restore_archive_id" "$reactivate" "$apply"
-    ;;
   tools)
-    [ "$#" -ge 1 ] || usage_error "用法：skillctl tools {detect|connect <工具id> [--apply]|disconnect <工具id> [--apply]}"
+    [ "$#" -ge 1 ] || usage_error "用法：skillctl tools {detect|connect <工具id> [--apply]|disconnect <工具id> [--apply]|add <平台名称> <技能目录路径> [--apply]}"
     tools_sub="$1"
     shift
     case "$tools_sub" in
+      add)
+        [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || usage_error "用法：skillctl tools add <平台名称> <技能目录路径> [--apply]"
+        tool_name="$1"
+        tool_dir="$2"
+        apply="no"
+        if [ "$#" -eq 3 ]; then
+          [ "$3" = "--apply" ] || usage_error "未知参数：$3；tools add 只接受结尾的 --apply"
+          apply="yes"
+        fi
+        cmd_add_custom_tool "$tool_name" "$tool_dir" "$apply"
+        if [ "$apply" = "yes" ]; then
+          auto_rebuild_dashboard
+        fi
+        ;;
       detect)
         [ "$#" -eq 0 ] || usage_error "tools detect 不接受参数"
         cmd_tools_detect
@@ -2129,11 +2658,11 @@ case "$command" in
           auto_rebuild_dashboard
         fi
         ;;
-      *) usage_error "未知的 tools 子命令：${tools_sub}；支持 detect/connect/disconnect" ;;
+      *) usage_error "未知的 tools 子命令：${tools_sub}；支持 detect/connect/disconnect/add" ;;
     esac
     ;;
   dashboard)
-    [ "$#" -ge 1 ] || usage_error "用法：skillctl dashboard {build [--apply]|open}"
+    [ "$#" -ge 1 ] || usage_error "用法：skillctl dashboard {build [--apply]|open|serve}"
     dashboard_sub="$1"
     shift
     case "$dashboard_sub" in
@@ -2150,7 +2679,11 @@ case "$command" in
         [ "$#" -eq 0 ] || usage_error "dashboard open 不接受参数"
         cmd_dashboard_open
         ;;
-      *) usage_error "未知的 dashboard 子命令：${dashboard_sub}；支持 build/open" ;;
+      serve)
+        [ "$#" -eq 0 ] || usage_error "dashboard serve 不接受参数"
+        cmd_dashboard_serve
+        ;;
+      *) usage_error "未知的 dashboard 子命令：${dashboard_sub}；支持 build/open/serve" ;;
     esac
     ;;
   eject)

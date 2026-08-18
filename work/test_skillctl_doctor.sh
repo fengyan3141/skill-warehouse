@@ -216,17 +216,27 @@ test_doctor_orphan_managed_link_not_in_manual_list_or_profile() {
 # （比如直接 ln -s 到另一个工具自己的 skill 目录）误判成"孤儿受管软链"，
 # 建议 activate/deactivate——但这种软链根本不归 skillctl 管，activate 会
 # 直接报"未登记 Skill"失败。孤儿检查必须先判断软链是否归属仓库
-# （eject_link_is_repo_managed 用的同一套判断），不归属仓库的外部软链要像
-# 别处的"外部软链冲突"一样被完全忽略，不体现在 doctor 输出里。
-test_doctor_ignores_foreign_link_not_pointing_into_repo() {
+# （eject_link_is_repo_managed 用的同一套判断），不归属仓库的外部软链不该
+# 被当成"仓库自己的孤儿链接"建议 activate/deactivate。
+#
+# v2 更新：这条测试原本断言 doctor 完全不提这类外部软链，但"货架未收编
+# 内容"这项检查后来加了新场景——外部软链如果指向的目录里确实有一份合法
+# SKILL.md、且还没登记进 catalog，doctor 现在会主动提示"这可能是收编前
+# 手动建的裸链接，要不要 import"，这是有意为之的新功能，不是回归。这里
+# 收窄成只守住最初要防的那个具体误判：不能把它当"仓库自己的孤儿受管
+# 软链"去建议 activate/deactivate（那样会直接报错，因为这个 id 压根没
+# 登记过）。
+test_doctor_foreign_link_gets_import_hint_not_activate_deactivate() {
   make_fixture
   mkdir -p "$TEST_ROOT/external-tool/skills/foreign-skill"
   make_skill "$TEST_ROOT/external-tool/skills/foreign-skill" "foreign-skill"
   ln -s "$TEST_ROOT/external-tool/skills/foreign-skill" "$TEST_HOME/.agents/skills/foreign-skill"
 
   run_skillctl_capture doctor
-  assert_eq "$SKILLCTL_STATUS" "0" "外部软链不影响 doctor 退出码"
-  assert_not_contains "$SKILLCTL_OUTPUT" "foreign-skill" "doctor 完全不提外部软链，不建议 activate/deactivate"
+  assert_eq "$SKILLCTL_STATUS" "0" "外部软链只产生警告，不影响 doctor 退出码"
+  assert_contains "$SKILLCTL_OUTPUT" "skillctl import" "货架未收编内容检查建议 import，不是 activate/deactivate"
+  assert_not_contains "$SKILLCTL_OUTPUT" "skillctl activate foreign-skill" "不把外部软链误判成仓库自己的孤儿受管软链"
+  assert_not_contains "$SKILLCTL_OUTPUT" "skillctl deactivate foreign-skill" "不把外部软链误判成仓库自己的孤儿受管软链"
   cleanup
   TEST_ROOT=""
 }
@@ -283,7 +293,7 @@ if [ -f "$SKILLCTL" ]; then
   test_doctor_verification_ok_when_none_unverified
   test_doctor_manual_list_link_missing
   test_doctor_orphan_managed_link_not_in_manual_list_or_profile
-  test_doctor_ignores_foreign_link_not_pointing_into_repo
+  test_doctor_foreign_link_gets_import_hint_not_activate_deactivate
   test_doctor_detects_missing_skill_md_and_missing_fields
   test_doctor_detects_duplicate_catalog_ids
   test_doctor_detects_catalog_disk_mismatch_both_directions

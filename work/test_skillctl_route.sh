@@ -78,7 +78,7 @@ make_fixture() {
 }
 
 test_read_only_chinese_listing_search_and_route() {
-  local library home output output_many expected count chars before after status_output archive_status
+  local library home output output_many expected count chars before after status_output
   local output_1199 output_1200 output_1201
   make_fixture
   library="$FIXTURE_LIBRARY"
@@ -150,21 +150,12 @@ test_read_only_chinese_listing_search_and_route() {
   status_output="$(HOME="$home" SKILL_LIBRARY_ROOT="$library" /bin/bash "$SKILLCTL" status)"
   assert_contains "$status_output" $'全局\t已激活\t' "状态显示受管软链已激活"
   assert_contains "$status_output" $'全局\t仓库中\t' "状态显示仓库中的技能"
-  assert_contains "$status_output" $'全局\t已归档\t' "状态显示归档技能"
-  assert_contains "$status_output" $'全局\t缺失\t' "状态显示缺失技能"
+  # v2：archive/ 归档机制已整体移除，catalog 登记了路径但磁盘上找不到内容
+  # （这份夹具用 archive/missing-skill-20260814 模拟）现在统一归为"缺失"，
+  # 不再有单独的"已归档"状态——这条断言就是在验证这个新行为，不是遗漏。
+  assert_contains "$status_output" $'全局\t缺失\t' "状态显示缺失技能（含归档机制移除前遗留的 archive/ 目录，统一按缺失处理）"
   assert_contains "$status_output" $'全局\t真实目录冲突\t' "状态显示真实目录冲突"
   assert_contains "$status_output" $'全局\t外部软链冲突\t' "状态显示外部软链冲突"
-
-  mkdir -p "$TEST_ROOT/no-maxdepth-bin"
-  printf '%s\n' \
-    '#!/bin/bash' \
-    'for argument in "$@"; do' \
-    '  [ "$argument" != "-maxdepth" ] || exit 64' \
-    'done' \
-    'exec /usr/bin/find "$@"' > "$TEST_ROOT/no-maxdepth-bin/find"
-  chmod +x "$TEST_ROOT/no-maxdepth-bin/find"
-  archive_status="$(PATH="$TEST_ROOT/no-maxdepth-bin:$PATH" HOME="$home" SKILL_LIBRARY_ROOT="$library" /bin/bash "$SKILLCTL" status)"
-  assert_contains "$archive_status" $'全局\t已归档\t缺失技能\tmissing-skill' "不依赖 -maxdepth 也能识别带后缀的归档目录"
 
   { snapshot_tree "$library"; snapshot_tree "$home"; } > "$SNAPSHOT_AFTER"
   before="$(<"$SNAPSHOT_BEFORE")"

@@ -153,8 +153,8 @@ test_import_differing_without_replace_blocks() {
   TEST_ROOT=""
 }
 
-test_import_replace_archives_old_version() {
-  local incoming incoming2 count
+test_import_replace_trashes_old_version() {
+  local incoming incoming2
   make_fixture
   incoming="$TEST_ROOT/incoming"
   make_incoming "$incoming" "test-skill" "body one"
@@ -167,9 +167,12 @@ test_import_replace_archives_old_version() {
   run_skillctl_capture import "$incoming2" --replace --apply
   assert_eq "$SKILLCTL_STATUS" "0" "替换导入成功退出"
   assert_contains "$(cat "$LIBRARY/skills/test-skill/SKILL.md")" "body two" "替换后仓库内容为新版本"
-  count="$(find "$LIBRARY/archive/test-skill" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
-  assert_eq "$count" "1" "旧版本移入归档目录"
-  assert_exists "$LIBRARY/archive/test-skill/manifest.tsv" "归档写入清单"
+  # v2：旧版本走 trash_path()（Finder 废纸篓，失败退回 ~/.Trash），不再走
+  # 仓库内部的 archive/ 备份——这里只断言"没有再造出 archive/ 这套内部机
+  # 制"，不去断言真实 Trash 的落地路径：那一步依赖 osascript/Finder 自动
+  # 化权限，在没有辅助功能授权的沙箱环境里跑会挂起或弹权限框，不适合放进
+  # 自动化断言。
+  assert_not_exists "$LIBRARY/archive" "替换后不再创建仓库内部 archive/ 目录"
   cleanup
   TEST_ROOT=""
 }
@@ -215,131 +218,6 @@ test_import_works_before_catalog_exists() {
   TEST_ROOT=""
 }
 
-test_archive_moves_to_nested_dir_with_manifest() {
-  local incoming archive_id_dir archive_id manifest
-  make_fixture
-  incoming="$TEST_ROOT/incoming"
-  make_incoming "$incoming" "test-skill"
-  run_skillctl_capture import "$incoming" --display-name '测试技能' --activate --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "导入并激活成功退出"
-  assert_exists "$TEST_HOME/.agents/skills/test-skill" "导入激活创建受管软链"
-
-  run_skillctl_capture archive test-skill
-  assert_eq "$SKILLCTL_STATUS" "0" "归档预演成功退出"
-  assert_contains "$SKILLCTL_OUTPUT" '[预演] 归档 test-skill' "归档预演输出中文动作"
-  assert_exists "$LIBRARY/skills/test-skill" "归档预演不移动 Skill"
-  assert_exists "$TEST_HOME/.agents/skills/test-skill" "归档预演不移除受管软链"
-
-  run_skillctl_capture archive test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "归档成功退出"
-  assert_not_exists "$LIBRARY/skills/test-skill" "归档移出活动仓库"
-  assert_exists "$LIBRARY/archive/test-skill" "归档目录保留版本"
-  assert_not_exists "$TEST_HOME/.agents/skills/test-skill" "归档移除受管软链"
-
-  manifest="$(cat "$LIBRARY/archive/test-skill/manifest.tsv")"
-  assert_contains "$manifest" "$(printf 'test-skill\t')" "归档清单记录 Skill ID"
-  assert_contains "$manifest" "$TEST_HOME/.agents/skills" "归档清单记录受管链接"
-
-  archive_id_dir="$(find "$LIBRARY/archive/test-skill" -mindepth 1 -maxdepth 1 -type d | head -1)"
-  assert_exists "$archive_id_dir/SKILL.md" "归档保留 Skill 内容"
-  archive_id="$(basename "$archive_id_dir")"
-  case "$archive_id" in
-    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-????????) ok "归档 ID 符合时间戳加哈希格式" ;;
-    *) not_ok "归档 ID 符合时间戳加哈希格式" ;;
-  esac
-  cleanup
-  TEST_ROOT=""
-}
-
-test_archive_blocks_on_unregistered_reference() {
-  local incoming
-  make_fixture
-  incoming="$TEST_ROOT/incoming"
-  make_incoming "$incoming" "blocked-skill"
-  run_skillctl_capture import "$incoming" --display-name '受阻技能' --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "受阻技能导入成功退出"
-
-  mkdir -p "$TEST_HOME/.agents/skills/blocked-skill"
-  run_skillctl_capture archive blocked-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "1" "无法确认归属时归档失败"
-  assert_contains "$SKILLCTL_OUTPUT" "无法确认归属" "归档报告未登记引用"
-  assert_exists "$LIBRARY/skills/blocked-skill" "阻塞时仓库版本不移动"
-  assert_not_exists "$LIBRARY/archive/blocked-skill" "阻塞时不创建归档目录"
-  cleanup
-  TEST_ROOT=""
-}
-
-test_restore_without_and_with_reactivate() {
-  local incoming
-  make_fixture
-  incoming="$TEST_ROOT/incoming"
-  make_incoming "$incoming" "test-skill"
-  run_skillctl_capture import "$incoming" --display-name '测试技能' --activate --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "导入并激活成功退出"
-  run_skillctl_capture archive test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "归档前置成功退出"
-  assert_not_exists "$LIBRARY/skills/test-skill" "归档前置：Skill 已移出仓库"
-
-  run_skillctl_capture restore test-skill
-  assert_eq "$SKILLCTL_STATUS" "0" "恢复预演成功退出"
-  assert_not_exists "$LIBRARY/skills/test-skill" "恢复预演不移动内容"
-
-  run_skillctl_capture restore test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "恢复成功退出"
-  assert_exists "$LIBRARY/skills/test-skill/SKILL.md" "恢复返回仓库"
-  assert_not_exists "$TEST_HOME/.agents/skills/test-skill" "未指定 reactivate 不恢复受管软链"
-
-  run_skillctl_capture activate test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "二次归档前重新激活成功退出"
-  run_skillctl_capture archive test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "二次归档成功退出"
-  run_skillctl_capture restore test-skill --reactivate --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "显式恢复并重新激活成功退出"
-  assert_exists "$LIBRARY/skills/test-skill/SKILL.md" "再次恢复返回仓库"
-  assert_exists "$TEST_HOME/.agents/skills/test-skill" "显式 reactivate 恢复安全链接"
-  assert_eq "$(readlink "$TEST_HOME/.agents/skills/test-skill")" "../../.skill-library/skills/test-skill" "reactivate 恢复标准相对软链"
-  cleanup
-  TEST_ROOT=""
-}
-
-test_restore_blocks_when_skill_already_present() {
-  local incoming
-  make_fixture
-  incoming="$TEST_ROOT/incoming"
-  make_incoming "$incoming" "test-skill"
-  run_skillctl_capture import "$incoming" --display-name '测试技能' --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "导入成功退出"
-
-  run_skillctl_capture restore test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "1" "仓库已有同名 Skill 时恢复失败"
-  assert_contains "$SKILLCTL_OUTPUT" "已存在" "恢复报告同名冲突"
-  cleanup
-  TEST_ROOT=""
-}
-
-test_restore_reactivation_collision_is_skipped() {
-  local incoming
-  make_fixture
-  incoming="$TEST_ROOT/incoming"
-  make_incoming "$incoming" "test-skill"
-  run_skillctl_capture import "$incoming" --display-name '测试技能' --activate --apply
-  run_skillctl_capture archive test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "归档成功退出"
-
-  mkdir -p "$TEST_HOME/.agents/skills/test-skill"
-  run_skillctl_capture restore test-skill --reactivate --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "重新激活冲突时恢复仍成功退出"
-  assert_exists "$LIBRARY/skills/test-skill/SKILL.md" "内容仍然恢复"
-  assert_contains "$SKILLCTL_OUTPUT" '[跳过] 真实目录冲突 test-skill' "重新激活冲突被跳过"
-  if [ -L "$TEST_HOME/.agents/skills/test-skill" ]; then
-    not_ok "占用目录未被替换为软链"
-  else
-    ok "占用目录未被替换为软链"
-  fi
-  cleanup
-  TEST_ROOT=""
-}
-
 test_replace_rollback_restores_old_version_on_staging_conflict() {
   local incoming incoming2 old_hash new_hash
   make_fixture
@@ -355,7 +233,7 @@ test_replace_rollback_restores_old_version_on_staging_conflict() {
 
   run_skillctl_capture import "$incoming2" --replace --apply
   assert_eq "$SKILLCTL_STATUS" "1" "复制失败的替换返回失败"
-  assert_contains "$SKILLCTL_OUTPUT" "已回滚" "替换失败报告已回滚"
+  assert_contains "$SKILLCTL_OUTPUT" "导入失败" "替换失败报告导入失败"
   assert_exists "$LIBRARY/skills/test-skill/SKILL.md" "回滚后仓库仍有 Skill"
   new_hash="$(shasum -a 256 "$LIBRARY/skills/test-skill/SKILL.md" | awk '{print $1}')"
   assert_eq "$new_hash" "$old_hash" "回滚恢复为旧版本内容"
@@ -382,14 +260,9 @@ if [ -f "$SKILLCTL" ]; then
   test_import_creates_skill_and_keeps_source
   test_import_identical_is_noop
   test_import_differing_without_replace_blocks
-  test_import_replace_archives_old_version
+  test_import_replace_trashes_old_version
   test_import_recursive_source_refused
   test_import_works_before_catalog_exists
-  test_archive_moves_to_nested_dir_with_manifest
-  test_archive_blocks_on_unregistered_reference
-  test_restore_without_and_with_reactivate
-  test_restore_blocks_when_skill_already_present
-  test_restore_reactivation_collision_is_skipped
   test_replace_rollback_restores_old_version_on_staging_conflict
   test_import_reuses_existing_alias_without_display_name
 fi

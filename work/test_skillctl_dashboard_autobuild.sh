@@ -150,45 +150,6 @@ test_import_without_activate_does_not_rebuild_dashboard() {
   TEST_ROOT=""
 }
 
-test_archive_apply_auto_rebuilds_dashboard() {
-  make_fixture
-  run_skillctl_capture activate test-skill --apply
-  rm -f "$HTML"
-
-  run_skillctl_capture archive test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "archive apply 成功退出"
-  assert_contains "$SKILLCTL_OUTPUT" "已自动重建本地面板" "archive apply 报告已自动重建面板"
-  assert_exists "$HTML" "archive --apply 后面板已生成"
-  cleanup
-  TEST_ROOT=""
-}
-
-test_restore_reactivate_apply_auto_rebuilds_dashboard() {
-  make_fixture
-  run_skillctl_capture activate test-skill --apply
-  run_skillctl_capture archive test-skill --apply
-  rm -f "$HTML"
-
-  run_skillctl_capture restore test-skill --reactivate --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "restore --reactivate apply 成功退出"
-  assert_contains "$SKILLCTL_OUTPUT" "已自动重建本地面板" "restore --reactivate apply 报告已自动重建面板"
-  assert_exists "$HTML" "restore --reactivate --apply 后面板已生成"
-  cleanup
-  TEST_ROOT=""
-}
-
-test_restore_without_reactivate_does_not_rebuild_dashboard() {
-  make_fixture
-  run_skillctl_capture activate test-skill --apply
-  run_skillctl_capture archive test-skill --apply
-  rm -f "$HTML"
-
-  run_skillctl_capture restore test-skill --apply
-  assert_eq "$SKILLCTL_STATUS" "0" "restore（不带 --reactivate）apply 成功退出"
-  assert_not_exists "$HTML" "restore 不带 --reactivate 时不自动重建面板"
-  cleanup
-  TEST_ROOT=""
-}
 
 test_eject_apply_auto_rebuilds_dashboard() {
   make_fixture
@@ -240,9 +201,6 @@ if [ -f "$SKILLCTL" ]; then
   test_tools_connect_and_disconnect_apply_auto_rebuild_dashboard
   test_import_activate_apply_auto_rebuilds_dashboard
   test_import_without_activate_does_not_rebuild_dashboard
-  test_archive_apply_auto_rebuilds_dashboard
-  test_restore_reactivate_apply_auto_rebuilds_dashboard
-  test_restore_without_reactivate_does_not_rebuild_dashboard
   test_eject_apply_auto_rebuilds_dashboard
   test_ancestor_symlink_block_does_not_create_dashboard
 fi

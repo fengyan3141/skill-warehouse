@@ -8,3 +8,4 @@ trae	TRAE	link	~/.trae/skills	.trae/skills	trae	Trae	确认软链目标为 ~/.ag
 trae-cn	TraeCode CN	link	~/.trae-cn/skills	.trae-cn/skills		Trae CN	确认软链目标为 ~/.agents/skills
 codebuddy	CodeBuddy	link	~/.codebuddy/skills	.codebuddy/skills	codebuddy	CodeBuddy CN	确认软链目标为 ~/.agents/skills
 qoder	Qoder	link	~/.qoder/skills	.qoder/skills	qoder	Qoder	确认软链目标为 ~/.agents/skills
+windsurf	Windsurf	link	~/.codeium/windsurf/skills	.codeium/windsurf/skills		Windsurf	确认软链目标为 ~/.agents/skills

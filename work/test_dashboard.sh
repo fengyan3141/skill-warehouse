@@ -55,6 +55,20 @@ codebuddy	CodeBuddy	link	~/.codebuddy/skills	.codebuddy/skills	codebuddy-fixture
 qoder	Qoder	link	~/.qoder/skills	.qoder/skills	qoder-fixture-cli	Qoder	已验证
 EOF
 
+  # 面板现在会把"内置适配器里没检测到的"直接隐藏（噪音过滤，见
+  # build-dashboard.sh 里 BUILTIN_TOOL_IDS 那段注释），不像 v1 时不管装没
+  # 装都全量展示。这份夹具要验证"每个适配器的信息正确展示"，就必须先让
+  # 它们都能被判定为"已检测"——伪造每个 cli_command 对应的可执行文件、
+  # 塞进一个只在本次测试生效的 PATH 前缀目录，不去碰真实系统 PATH。
+  mkdir -p "$TEST_ROOT/fake-bin"
+  local cli
+  for cli in codex-fixture-cli cursor-fixture-cli gemini-fixture-cli claude-fixture-cli \
+             kiro-fixture-cli trae-fixture-cli codebuddy-fixture-cli qoder-fixture-cli; do
+    printf '#!/bin/sh\nexit 0\n' > "$TEST_ROOT/fake-bin/$cli"
+    chmod +x "$TEST_ROOT/fake-bin/$cli"
+  done
+  export PATH="$TEST_ROOT/fake-bin:$PATH"
+
   add_catalog_row "ai-product-teardown" "skills/ai-product-teardown" "AI 产品拆解" "产品拆解" "product" "拆解" "" "深度拆解 <AI> 产品 & 架构"
   add_catalog_row "lark-doc" "skills/lark-doc" "飞书文档" "云文档" "lark" "飞书文档" "" "读取并编辑\"飞书\"文档"
   add_catalog_row "warehouse-only" "skills/warehouse-only" "仅在仓库" "" "test" "" "" "尚未激活的 Skill"
@@ -64,11 +78,6 @@ EOF
   make_skill "$LIBRARY/skills/lark-doc" "lark-doc"
   make_skill "$LIBRARY/skills/warehouse-only" "warehouse-only"
   make_skill "$LIBRARY/skills/conflict-skill" "conflict-skill"
-
-  mkdir -p "$LIBRARY/archive/lark-doc/20260101-093000-deadbeef"
-  make_skill "$LIBRARY/archive/lark-doc/20260101-093000-deadbeef" "lark-doc" "archived body"
-  printf 'lark-doc\t20260101-093000-deadbeef\tdeadbeef\t2026-01-01T09:30:00Z\tcore\t%s/.agents/skills\n' "$TEST_HOME" \
-    >> "$LIBRARY/archive/lark-doc/manifest.tsv"
 }
 
 run_skillctl() {
@@ -115,22 +124,24 @@ test_dashboard_content_and_escaping() {
   assert_contains "$html" '&lt;' "HTML 转义小于号"
   assert_contains "$html" '&gt;' "HTML 转义大于号"
   assert_contains "$html" '&quot;飞书&quot;' "HTML 转义引号"
-  assert_contains "$html" '只读面板' "面板明确只读"
+  assert_contains "$html" '静态快照' "面板明确标注这是静态快照"
   assert_contains "$html" "Skill 文件夹" "面板头部显示 Skill 文件夹地址"
   assert_contains "$html" "$LIBRARY/skills" "文件夹地址是真实绝对路径，随环境自动识别"
-  assert_not_contains "$html" 'fetch(' "面板没有写入后端请求"
-  assert_contains "$html" '归档模式' "面板提供归档点选模式入口"
-  assert_contains "$html" '激活/停用模式' "面板提供激活/停用点选模式入口"
+  # v2：静态构建和 dashboard serve 共用同一份前端脚本，字符串 "fetch(" 本身
+  # 会出现在文件里（写请求那几个函数体内），但这些函数体最前面都是
+  # "if (!LIVE) return;"，LIVE 只在 dashboard-server.py 注入的
+  # window.__DASHBOARD_LIVE__ 存在时才为真——静态构建的 build-dashboard.sh
+  # 只读那个变量、从不写它，所以真正该断言的不变量是"这次生成的 HTML 里没
+  # 有那个赋值语句"，而不是"整份脚本里不出现 fetch( 这个词"。
+  assert_not_contains "$html" '__DASHBOARD_LIVE__ =' "静态快照不注入 LIVE 标记，写请求代码路径不可达"
+  assert_contains "$html" '常驻模式' "面板提供常驻模式点选入口"
+  assert_contains "$html" '移入仓库模式' "面板提供移入仓库模式点选入口"
+  assert_contains "$html" '删除模式' "面板提供删除模式点选入口"
 
   assert_contains "$html" '仅在仓库' "面板显示未激活 Skill"
   assert_contains "$html" 'chip-warehouse' "未激活 Skill 标记为仓库中状态"
   assert_contains "$html" 'chip-active' "已激活 Skill 有对应状态样式"
   assert_contains "$html" 'chip-conflict' "真实目录冲突有对应状态样式"
-
-  assert_contains "$html" 'core' "归档区块显示原场景包"
-  assert_contains "$html" '20260101-093000-deadbeef' "归档区块显示归档版本号"
-  assert_contains "$html" "归档文件夹" "归档区块头部显示总文件夹的共用地址"
-  assert_contains "$html" "$LIBRARY/archive</code>" "归档区块头部地址是 archive/ 这个总目录，不是某个具体 id 的子文件夹"
 
   # 真实包的 config/profiles/core 里登记了 commit-message-writer /
   # code-review-checklist，但这个夹具的 catalog 里没有这两个 id（PROFILE_DIR
@@ -144,13 +155,11 @@ test_dashboard_content_and_escaping() {
   assert_contains "$profiles_section" '<td>0</td>' "数量只数实际能在仓库里找到的成员，不是场景包文件的行数"
   assert_contains "$profiles_section" "场景包文件里的成员都不在仓库中" "全部成员都缺失时给出空态提示"
 
-  # lark-doc 在这个夹具里既被 activate 回了 skills/（chip-active），也留着
-  # 一条历史归档记录（archive/lark-doc/manifest.tsv）——统计卡片的"已归档"
-  # 应该数 manifest 行数（=1），不是 skillctl status 给它打的"已激活"标签
-  # （数那个的话会是 0，跟下面归档表格里明明看得到一行对不上）。
-  local archived_stat
-  archived_stat="$(printf '%s' "$html" | grep -o 'stat-archived"><span class="stat-value">[0-9]*' | grep -o '[0-9]*$')"
-  assert_eq "$archived_stat" "1" "统计卡片已归档数量来自归档记录，不是几乎永远是 0 的 status 标签"
+  # 夹具里 4 个 Skill，ai-product-teardown 和 lark-doc 两个被 activate 了，
+  # 顶部统计磁贴的"已激活"数量应该正好是 2，不多不少。
+  local active_stat
+  active_stat="$(printf '%s' "$html" | grep -o 'stat-active"><span class="stat-value">[0-9]*' | grep -o '[0-9]*$')"
+  assert_eq "$active_stat" "2" "统计磁贴已激活数量与真实激活的 Skill 数一致"
 
   local adapter_id
   for adapter_id in codex cursor gemini-cli claude-code kiro trae codebuddy qoder; do
