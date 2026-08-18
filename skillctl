@@ -2527,6 +2527,20 @@ cmd_backup_sync() {
     if git merge -q --no-edit "origin/$branch"; then
       git push -q origin "$branch"
       printf '同步完成，已推送到远端\n'
+      # 同步拉进来的改动可能包含"另一台机器删掉了某个 Skill"——git 只管
+      # 仓库内部（skills/、catalog.tsv），不知道、也管不到这台机器自己的
+      # ~/.agents/skills 或各工具目录里那些指回仓库的软链，被删掉的 Skill
+      # 如果在本机是激活状态，同步完就会留下一个断链，deactivate 也清不
+      # 掉（找不到对应的仓库记录，会直接跳过）。之前只能等用户自己想起来
+      # 跑一次 doctor 才会发现；这里复用 doctor 同一套检查，同步完顺手扫
+      # 一遍，有断链才出声，没有就安静过去，不重复 doctor 里"没有发现
+      # 断链"这句正常场景的噪音。
+      DOCTOR_FAIL=0
+      doctor_check_global_broken_links
+      doctor_check_tool_broken_links
+      if [ "$DOCTOR_FAIL" -gt 0 ]; then
+        printf '\n⚠️ 上面这 %s 个断链，是同步带来的改动导致的（很可能是别的机器把对应 Skill 删了，这台机器还激活着）。按各自后面给的命令清理，或者内容还在的话 skillctl activate <id> --apply 重新收回来。\n' "$DOCTOR_FAIL"
+      fi
     else
       printf '⚠️ 远端和本地都改过同一批内容，自动合并停在这里，没有推送。冲突涉及：\n\n'
       git diff --name-only --diff-filter=U | while IFS= read -r conflict_file; do
