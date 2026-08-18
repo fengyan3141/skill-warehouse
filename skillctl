@@ -2228,12 +2228,29 @@ lint_check_frontmatter() {
   [ "$found" -eq 1 ] || lint_report ok "仓库内所有 Skill 的 frontmatter 完整，且 name 字段与目录名一致"
 }
 
-# 阈值取自真实仓库数据的分布，用 bash 的 ${#desc}（真正参与比较的字符数）
-# 量的，不是 awk length()（那个数的是字节数，中文按 UTF-8 三字节算，会把
-# 阈值撑大三倍——校准时踩过这个坑）：87 个 Skill 实际是 18~802 字，中位数
-# 193。下限 15 明显低于当前最短的 18（lark-attendance/debug-pro 这类范围
+# 数 UTF-8 字符数，不能用 bash 的 ${#desc}——那只在 bash 4+ 且当前 locale
+# 是 UTF-8 时才按字符数，系统自带的 /bin/bash（3.2，这个项目实际运行的
+# 版本）不认 locale，永远按字节数数，中文会被数成 3 倍（曾经当真按
+# ${#desc} 校准过阈值，结果在 3.2 下把字节数当字符数报，数字全错，
+# work/run_skill_library_tests.sh 里 test_lint_flags_too_long_description
+# 那条断言测出来的）。也不能用 awk 的 length()——不管 locale 是什么，
+# macOS 自带 awk 一样按字节数数，跟 ${#desc} 是同一个坑。
+# 唯一可靠的办法：总字节数减去 UTF-8 续字节数（0x80-0xFF 里的
+# 0x80-0xBF 那一段）——续字节不是新字符的起始字节，减掉之后剩下的就是
+# 真正的字符数，全程只按字节匹配，不依赖任何 locale 数据是否装在这台机
+# 器上。跟 clone_github_repo 里 `LC_ALL=C tr -d '\000-\037\177-\377'`
+# 是同一个"强制按字节处理"的思路。
+# 阈值取自真实仓库数据的分布：87 个 Skill 实际是 18~802 字，中位数 193。
+# 下限 15 明显低于当前最短的 18（lark-attendance/debug-pro 这类范围
 # 很窄的 Skill 天然就短，不该被当噪音报），上限 1000 明显高于当前最长的
 # 802，两头都留了余量，不会在现有内容上报警，只在真正偏离的新增内容上生效。
+utf8_char_count() {
+  local s="$1" byte_count cont_bytes
+  byte_count="$(printf '%s' "$s" | LC_ALL=C wc -c | tr -d ' ')"
+  cont_bytes="$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\177\300-\377' | LC_ALL=C wc -c | tr -d ' ')"
+  printf '%s' "$((byte_count - cont_bytes))"
+}
+
 lint_check_description_length() {
   local dir id desc len found=0
   [ -d "$SKILL_LIBRARY_ROOT/skills" ] || return 0
@@ -2244,7 +2261,7 @@ lint_check_description_length() {
     [ -f "$dir/SKILL.md" ] || continue
     desc="$(skill_description "$dir" 2>/dev/null || true)"
     [ -n "$desc" ] || continue
-    len="${#desc}"
+    len="$(utf8_char_count "$desc")"
     if [ "$len" -lt 15 ]; then
       found=1
       lint_report warn "$id 的 description 只有 $len 字，信息量可能不够，容易被路由/搜索漏选" "补充触发场景和典型用户表达，参考仓库里其他 Skill 的写法"
