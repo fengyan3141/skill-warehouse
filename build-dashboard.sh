@@ -51,6 +51,13 @@ html_escape() {
 # skillctl doctor 看详细诊断——两张卡片都是"能看不能点"，不满足这个面板
 # "一眼看状态、一键做操作"的定位。
 render_stats_cards() {
+  printf '<div class="stat-cards">\n'
+  render_status_summary_cards
+  render_backup_card
+  printf '</div>\n'
+}
+
+render_status_summary_cards() {
   local status_output
   status_output="$("$SKILLCTL_BIN" status 2>/dev/null)" || {
     printf '<p class="empty-note">无法读取状态统计。</p>\n'
@@ -60,13 +67,51 @@ render_stats_cards() {
   awk -F '\t' '
     $1 == "全局" { total++; count[$2]++ }
     END {
-      printf "<div class=\"stat-cards\">\n"
-      printf "<div class=\"stat-card\"><span class=\"stat-value\">%d</span><span class=\"stat-label\">全部 Skill</span></div>\n", total + 0
-      printf "<div class=\"stat-card stat-active\"><span class=\"stat-value\">%d</span><span class=\"stat-label\">已激活</span></div>\n", count["已激活"] + 0
-      printf "<div class=\"stat-card stat-warehouse\"><span class=\"stat-value\">%d</span><span class=\"stat-label\">仓库中</span></div>\n", count["仓库中"] + 0
-      printf "</div>\n"
+      printf "<div class=\"stat-card\"><span class=\"stat-value\">%d</span><span class=\"stat-label\" data-i18n=\"statTotal\">全部 Skill</span></div>\n", total + 0
+      printf "<div class=\"stat-card stat-active\"><span class=\"stat-value\">%d</span><span class=\"stat-label\" data-i18n=\"statActive\">已激活</span></div>\n", count["已激活"] + 0
+      printf "<div class=\"stat-card stat-warehouse\"><span class=\"stat-value\">%d</span><span class=\"stat-label\" data-i18n=\"statWarehouse\">仓库中</span></div>\n", count["仓库中"] + 0
     }
   ' <<< "$status_output"
+}
+
+# 备份卡片跟另外三张状态卡是同一批生成的，读的是 skillctl backup status
+# 的只读输出——静态快照模式下这张卡本身仍然会显示当时的真实状态（未开启/
+# 已同步/待同步），只有卡片里那颗"同步备份"按钮跟 check-updates-btn 一样
+# 需要本地服务才能点，静态模式下禁用、不提供复制命令的兜底（原因同
+# check-updates：单条命令 skillctl backup sync --apply 本身已经够短，禁用
+# 态的 title 提示已经把命令写清楚了，不需要再加一层复制交互）。
+render_backup_card() {
+  local status_output dirty behind extra_class
+  status_output="$("$SKILLCTL_BIN" backup status 2>/dev/null)"
+
+  if printf '%s' "$status_output" | grep -q '还不是 Git 仓库'; then
+    printf '<div class="stat-card stat-backup-off">\n<div class="stat-card-body">\n'
+    printf '<span class="stat-label" data-i18n="statBackup">GitHub 备份</span>\n'
+    printf '<p class="stat-hint"><span data-i18n="backupOffHintPre">终端运行 </span><code class="technical-id">skillctl backup init --apply</code><span data-i18n="backupOffHintPost"> 开启</span></p>\n'
+    printf '</div>\n</div>\n'
+    return 0
+  fi
+
+  dirty="$(printf '%s\n' "$status_output" | grep -oE '未提交改动：[0-9]+' | grep -oE '[0-9]+')"
+  behind="$(printf '%s\n' "$status_output" | grep -oE '落后远端：[0-9]+' | grep -oE '[0-9]+')"
+  dirty="${dirty:-0}"
+  behind="${behind:-0}"
+
+  extra_class=""
+  if [ "$dirty" != "0" ] || [ "$behind" != "0" ]; then
+    extra_class=" stat-backup-pending"
+  fi
+
+  # 之前这里还有一行"已同步/待同步"的大字，跟下面这行数字完全同义、纯属
+  # 重复——现在状态只靠云朵图标的颜色（图标颜色由外层 stat-backup/
+  # stat-backup-pending 这两个 class 驱动，见上面的 CSS）加这行具体数字
+  # 传达，不再用一个大词复述一遍。
+  printf '<div class="stat-card stat-backup%s">\n<div class="stat-card-body">\n' "$extra_class"
+  printf '<span class="stat-label" data-i18n="statBackup">GitHub 备份</span>\n'
+  printf '<p class="stat-hint" data-i18n-template="backupHint" data-dirty="%s" data-behind="%s">未提交 %s 项・落后远端 %s 个提交</p>\n' \
+    "$(html_escape "$dirty")" "$(html_escape "$behind")" "$(html_escape "$dirty")" "$(html_escape "$behind")"
+  printf '<button type="button" id="backup-sync-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnBackupSync" onclick="runBackupSync()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">同步到云端</button>\n'
+  printf '</div>\n</div>\n'
 }
 
 render_skills_table() {
@@ -128,7 +173,7 @@ render_skills_table() {
     printf '%s\t%s\n' "$catalog_id" "$plist" >> "$profiles_map_file"
   done < "$CATALOG_FILE"
 
-  printf '<table id="skills-table"><thead><tr><th>状态</th><th>中文名称</th><th>英文 ID</th><th>分类</th><th>所属场景包</th><th>简介</th></tr></thead><tbody>\n'
+  printf '<table id="skills-table"><thead><tr><th data-i18n="thStatus">状态</th><th data-i18n="thName">中文名称</th><th data-i18n="thId">英文 ID</th><th data-i18n="thCategory">分类</th><th data-i18n="thProfiles">所属场景包</th><th data-i18n="thDescription">简介</th></tr></thead><tbody>\n'
   awk -F '\t' -v status_map_file="$status_map_file" -v profiles_map_file="$profiles_map_file" -v batch_map_file="$batch_map_file" '
     function html_escape(s) {
       gsub(/&/, "\\&amp;", s)
@@ -190,7 +235,7 @@ render_skills_table() {
 
 render_profiles_section() {
   local pfile pname count members display_line member_id member_html
-  printf '<table><thead><tr><th>场景包</th><th>数量</th><th>成员</th></tr></thead><tbody>\n'
+  printf '<table><thead><tr><th data-i18n="thProfileName">场景包</th><th data-i18n="thProfileCount">数量</th><th data-i18n="thProfileMembers">成员</th></tr></thead><tbody>\n'
   for pfile in "$PROFILE_DIR"/*; do
     [ -f "$pfile" ] || continue
     pname="$(basename "$pfile")"
@@ -223,13 +268,13 @@ render_profiles_section() {
 BUILTIN_TOOL_IDS=" codex cursor gemini-cli claude-code kiro trae trae-cn codebuddy qoder windsurf "
 
 render_adapters_section() {
-  local adapters_file detect_output id display mode _global_dir _project_dir _cli_command _app_name verification status mode_label command_text is_builtin
+  local adapters_file detect_output id display mode _global_dir _project_dir _cli_command _app_name verification status mode_label mode_label_key command_text is_builtin
   adapters_file="${SKILL_ADAPTERS:-$PACKAGE_ROOT/config/adapters/tools.tsv}"
   [ -f "$adapters_file" ] || { printf '<p class="empty-note">软件适配器配置不存在。</p>\n'; return 0; }
 
   detect_output="$("$SKILLCTL_BIN" tools detect 2>/dev/null || true)"
 
-  printf '<table><thead><tr><th>软件</th><th>状态</th><th>接入方式</th><th>安全命令</th></tr></thead><tbody>\n'
+  printf '<table><thead><tr><th data-i18n="thTool">软件</th><th data-i18n="thStatus">状态</th><th data-i18n="thToolMode">接入方式</th><th data-i18n="thToolCommand">安全命令</th></tr></thead><tbody>\n'
   while IFS=';' read -r id display mode _global_dir _project_dir _cli_command _app_name verification; do
     [ -n "$id" ] || continue
     case "$id" in \#*) continue ;; esac
@@ -248,9 +293,11 @@ render_adapters_section() {
     fi
     if [ "$mode" = "native" ]; then
       mode_label="原生"
+      mode_label_key="modeNative"
       command_text="（原生模式，自动共享全局 Skill 目录，无需命令）"
     else
       mode_label="软链"
+      mode_label_key="modeLink"
       # 这里的 ~ 是给用户看的字面文本（面板上一键复制的命令），不是要展开
       # 的路径，故意不用 $HOME 拼接。
       # shellcheck disable=SC2088
@@ -258,12 +305,13 @@ render_adapters_section() {
       [ "$verification" = "unverified" ] && command_text="$command_text --allow-unverified"
       command_text="$command_text --apply"
     fi
-    printf '<tr><td>%s <code class="technical-id">%s</code></td><td><span class="chip %s">%s</span></td><td>%s</td><td>' \
-      "$(html_escape "$display")" "$(html_escape "$id")" "$(adapter_status_class "$status")" "$(html_escape "$status")" "$(html_escape "$mode_label")"
+    printf '<tr><td>%s <code class="technical-id">%s</code></td><td><span class="chip %s" data-i18n="%s">%s</span></td><td data-i18n="%s">%s</td><td>' \
+      "$(html_escape "$display")" "$(html_escape "$id")" "$(adapter_status_class "$status")" "$(adapter_status_i18n_key "$status")" "$(html_escape "$status")" \
+      "$mode_label_key" "$(html_escape "$mode_label")"
     if [ "$mode" = "native" ]; then
-      printf '<span class="empty-note">%s</span>' "$(html_escape "$command_text")"
+      printf '<span class="empty-note" data-i18n="toolNativeHint">%s</span>' "$(html_escape "$command_text")"
     else
-      printf '<code class="technical-id">%s</code> <button type="button" class="copy-btn" onclick="copyCommand(this, %s)">复制</button>' \
+      printf '<code class="technical-id">%s</code> <button type="button" class="copy-btn" data-i18n="copyBtn" onclick="copyCommand(this, %s)">复制</button>' \
         "$(html_escape "$command_text")" "$(js_string_literal "$command_text")"
     fi
     printf '</td></tr>\n'
@@ -276,6 +324,14 @@ adapter_status_class() {
     已检测) printf 'chip-active\n' ;;
     可能是残留目录) printf 'chip-archived\n' ;;
     *) printf 'chip-missing\n' ;;
+  esac
+}
+
+adapter_status_i18n_key() {
+  case "$1" in
+    已检测) printf 'toolDetected\n' ;;
+    可能是残留目录) printf 'toolResidual\n' ;;
+    *) printf 'toolNotDetected\n' ;;
   esac
 }
 
@@ -430,17 +486,19 @@ generate_dashboard() {
     display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 8px;
     margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--border);
   }
-  .theme-switch {
+  .header-switches { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .theme-switch, .lang-switch {
     display: inline-flex; gap: 2px; padding: 3px; border-radius: 999px;
     background: var(--surface-2); border: 1px solid var(--border); flex-shrink: 0;
   }
-  button.theme-switch-btn {
+  button.theme-switch-btn, button.lang-switch-btn {
     width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
     border-radius: 999px; border: none; background: transparent; color: var(--text-muted); cursor: pointer;
     transition: background 0.15s ease, color 0.15s ease;
   }
-  button.theme-switch-btn:hover { color: var(--text); }
-  button.theme-switch-btn.active { background: var(--surface); color: var(--primary); box-shadow: var(--shadow-sm); }
+  button.lang-switch-btn { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.02em; }
+  button.theme-switch-btn:hover, button.lang-switch-btn:hover { color: var(--text); }
+  button.theme-switch-btn.active, button.lang-switch-btn.active { background: var(--surface); color: var(--primary); box-shadow: var(--shadow-sm); }
   .section-header-row {
     display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 12px;
     margin: 0 0 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border);
@@ -465,6 +523,12 @@ generate_dashboard() {
   .stat-card.stat-active::before { content: "●"; background: var(--success-bg); color: var(--success); }
   .stat-card.stat-active .stat-value { color: var(--success); }
   .stat-card.stat-warehouse::before { content: "▤"; background: var(--primary-bg); color: var(--primary); }
+  .stat-card.stat-backup::before { content: "☁"; background: var(--success-bg); color: var(--success); }
+  .stat-card.stat-backup-pending::before { content: "☁"; background: var(--warning-bg); color: var(--warning); }
+  .stat-card.stat-backup-off::before { content: "☁"; background: var(--neutral-bg); color: var(--neutral); }
+  .stat-card-body { flex: 1; min-width: 0; }
+  .stat-hint { font-size: 0.72rem; color: var(--text-muted); margin: 4px 0 6px; line-height: 1.4; }
+  .stat-card-body button.mode-toggle-btn { margin-top: 2px; }
   section {
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
     padding: 18px 20px; margin-bottom: 20px; box-shadow: var(--shadow-sm); scroll-margin-top: 16px;
@@ -683,17 +747,29 @@ generate_dashboard() {
   } catch (e) {}
 })();
 </script>
+<script>
+// 语言选择同样要在渲染前应用，跟主题那段是同一个道理——避免先按中文（页面
+// 生成时烤进 HTML 的默认语言）闪一下再切到用户存的英文选择。这里只标记
+// data-lang，真正把每个 [data-i18n] 元素的文字换掉的 applyLanguage() 得等
+// DOM 解析完才能跑，在下面的主脚本里、updateThemeSwitchUI() 那个位置调用。
+(function () {
+  try {
+    var l = localStorage.getItem('skill-dashboard-lang');
+    if (l === 'en') document.documentElement.dataset.lang = 'en';
+  } catch (e) {}
+})();
+</script>
 <div class="shell">
   <aside class="side-nav">
     <div class="side-brand">
       <span class="side-logo"><svg width="18" height="18" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="11" y="3" width="6" height="6" rx="1.5" opacity="0.55"/><rect x="3" y="11" width="6" height="6" rx="1.5" opacity="0.55"/><rect x="11" y="11" width="6" height="6" rx="1.5"/></svg></span>
-      <div class="side-brand-text"><strong>Skill 仓库</strong><small>本地工作台</small></div>
+      <div class="side-brand-text"><strong data-i18n="brandTitle">Skill 仓库</strong><small data-i18n="brandSubtitle">本地工作台</small></div>
     </div>
     <nav id="side-nav-links">
-      <a class="side-link" href="#top" data-target="top"><span class="side-link-dot"></span>总览</a>
-      <a class="side-link" href="#skills-section" data-target="skills-section"><span class="side-link-dot"></span>Skill 列表</a>
-      <a class="side-link" href="#profiles-section" data-target="profiles-section"><span class="side-link-dot"></span>场景包</a>
-      <a class="side-link" href="#adapters-section" data-target="adapters-section"><span class="side-link-dot"></span>软件接入</a>
+      <a class="side-link" href="#top" data-target="top"><span class="side-link-dot"></span><span data-i18n="navOverview">总览</span></a>
+      <a class="side-link" href="#skills-section" data-target="skills-section"><span class="side-link-dot"></span><span data-i18n="navSkills">Skill 列表</span></a>
+      <a class="side-link" href="#profiles-section" data-target="profiles-section"><span class="side-link-dot"></span><span data-i18n="navProfiles">场景包</span></a>
+      <a class="side-link" href="#adapters-section" data-target="adapters-section"><span class="side-link-dot"></span><span data-i18n="navAdapters">软件接入</span></a>
     </nav>
     <div class="side-foot">skillctl dashboard</div>
   </aside>
@@ -702,31 +778,37 @@ generate_dashboard() {
 HTML_HEAD
 
   printf '<header class="page-header">\n<div>\n'
-  printf '<h1>Skill 中央仓库</h1>\n'
-  printf '<p class="subtitle" id="build-subtitle">生成时间：%s ・ 本页为静态快照，需重新运行 <code class="technical-id">skillctl dashboard build --apply</code> 才会刷新</p>\n' "$(html_escape "$generated_at")"
-  printf '<p class="subtitle">Skill 文件夹：<code class="technical-id">%s</code> <button type="button" class="copy-btn" onclick="copyCommand(this, %s)">复制</button>（粘贴到 Finder"前往文件夹"可直接跳转，快捷键 Cmd+Shift+G）</p>\n' \
+  printf '<h1 data-i18n="h1Title">Skill 中央仓库</h1>\n'
+  printf '<p class="subtitle" id="build-subtitle"><span data-i18n="genAtPre">生成时间：</span>%s<span data-i18n="genAtPost"> ・ 本页为静态快照，需重新运行 </span><code class="technical-id">skillctl dashboard build --apply</code><span data-i18n="genAtPost2"> 才会刷新</span></p>\n' "$(html_escape "$generated_at")"
+  printf '<p class="subtitle"><span data-i18n="skillFolderPre">Skill 文件夹：</span><code class="technical-id">%s</code> <button type="button" class="copy-btn" data-i18n="copyBtn" onclick="copyCommand(this, %s)">复制</button><span data-i18n="skillFolderPost">（粘贴到 Finder"前往文件夹"可直接跳转，快捷键 Cmd+Shift+G）</span></p>\n' \
     "$(html_escape "$SKILL_LIBRARY_ROOT/skills")" "$(js_string_literal "$SKILL_LIBRARY_ROOT/skills")"
   printf '</div>\n'
+  printf '<div class="header-switches">\n'
+  printf '<div class="lang-switch" id="lang-switch" role="group" aria-label="语言">\n'
+  printf '<button type="button" class="lang-switch-btn" data-lang-choice="zh" onclick="setLangChoice(this.dataset.langChoice)" title="中文">中</button>\n'
+  printf '<button type="button" class="lang-switch-btn" data-lang-choice="en" onclick="setLangChoice(this.dataset.langChoice)" title="English">EN</button>\n'
+  printf '</div>\n'
   printf '<div class="theme-switch" id="theme-switch" role="group" aria-label="外观">\n'
-  printf '<button type="button" class="theme-switch-btn" data-theme-choice="light" onclick="setThemeChoice(this.dataset.themeChoice)" title="日间模式"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>\n'
-  printf '<button type="button" class="theme-switch-btn" data-theme-choice="dark" onclick="setThemeChoice(this.dataset.themeChoice)" title="夜间模式"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z"/></svg></button>\n'
-  printf '<button type="button" class="theme-switch-btn" data-theme-choice="system" onclick="setThemeChoice(this.dataset.themeChoice)" title="跟随系统"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></button>\n'
+  printf '<button type="button" class="theme-switch-btn" data-theme-choice="light" onclick="setThemeChoice(this.dataset.themeChoice)" title="日间模式" data-i18n-title="themeLight"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>\n'
+  printf '<button type="button" class="theme-switch-btn" data-theme-choice="dark" onclick="setThemeChoice(this.dataset.themeChoice)" title="夜间模式" data-i18n-title="themeDark"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z"/></svg></button>\n'
+  printf '<button type="button" class="theme-switch-btn" data-theme-choice="system" onclick="setThemeChoice(this.dataset.themeChoice)" title="跟随系统" data-i18n-title="themeSystem"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></button>\n'
+  printf '</div>\n'
   printf '</div>\n'
   printf '</header>\n'
 
   render_stats_cards
 
-  printf '<section id="skills-section">\n<h2>Skill 列表</h2>\n'
+  printf '<section id="skills-section">\n<h2 data-i18n="sectionSkills">Skill 列表</h2>\n'
   printf '<div class="controls">\n'
-  printf '<input type="search" id="skill-search" placeholder="按中文名称、别名或英文 ID 搜索…" oninput="applyFilters()">\n'
-  printf '<select id="status-filter" onchange="applyFilters()"><option value="">全部状态</option><option value="已激活">已激活</option><option value="仓库中">仓库中</option></select>\n'
-  printf '<button type="button" id="activate-mode-btn" class="mode-toggle-btn" data-mode="activate" onclick="toggleSelectionMode(%s)">常驻模式</button>\n' "$(js_string_literal activate)"
-  printf '<button type="button" id="deactivate-mode-btn" class="mode-toggle-btn" data-mode="deactivate" onclick="toggleSelectionMode(%s)">移入仓库模式</button>\n' "$(js_string_literal deactivate)"
-  printf '<button type="button" id="delete-mode-btn" class="mode-toggle-btn" data-mode="delete" onclick="toggleSelectionMode(%s)">删除模式</button>\n' "$(js_string_literal delete)"
+  printf '<input type="search" id="skill-search" placeholder="按中文名称、别名或英文 ID 搜索…" data-i18n-placeholder="searchPlaceholder" oninput="applyFilters()">\n'
+  printf '<select id="status-filter" onchange="applyFilters()"><option value="" data-i18n="filterAll">全部状态</option><option value="已激活" data-i18n="statActive">已激活</option><option value="仓库中" data-i18n="statWarehouse">仓库中</option></select>\n'
+  printf '<button type="button" id="activate-mode-btn" class="mode-toggle-btn" data-mode="activate" data-i18n="modeActivate" onclick="toggleSelectionMode(%s)">常驻模式</button>\n' "$(js_string_literal activate)"
+  printf '<button type="button" id="deactivate-mode-btn" class="mode-toggle-btn" data-mode="deactivate" data-i18n="modeDeactivate" onclick="toggleSelectionMode(%s)">移入仓库模式</button>\n' "$(js_string_literal deactivate)"
+  printf '<button type="button" id="delete-mode-btn" class="mode-toggle-btn" data-mode="delete" data-i18n="modeDelete" onclick="toggleSelectionMode(%s)">删除模式</button>\n' "$(js_string_literal delete)"
   printf '<div class="controls-secondary">\n'
-  printf '<button type="button" id="github-import-btn" class="mode-toggle-btn btn-ghost" onclick="openGithubWizard()" disabled title="需要本地服务：skillctl dashboard serve">从 GitHub 导入</button>\n'
-  printf '<button type="button" id="upload-import-btn" class="mode-toggle-btn btn-ghost" onclick="openUploadWizard()" disabled title="需要本地服务：skillctl dashboard serve">本地拖拽导入</button>\n'
-  printf '<button type="button" id="check-updates-btn" class="mode-toggle-btn btn-ghost" onclick="runCheckUpdates()" disabled title="需要本地服务：skillctl dashboard serve">检查更新</button>\n'
+  printf '<button type="button" id="github-import-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnGithubImport" onclick="openGithubWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">从 GitHub 导入</button>\n'
+  printf '<button type="button" id="upload-import-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnUploadImport" onclick="openUploadWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">本地拖拽导入</button>\n'
+  printf '<button type="button" id="check-updates-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnCheckUpdates" onclick="runCheckUpdates()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">检查更新</button>\n'
   printf '</div>\n'
   printf '</div>\n'
   render_skills_table
@@ -754,13 +836,13 @@ HTML_HEAD
   printf '<div id="up-body"></div>\n'
   printf '</div>\n</div>\n'
 
-  printf '<section id="profiles-section">\n<h2>场景包</h2>\n'
+  printf '<section id="profiles-section">\n<h2 data-i18n="sectionProfiles">场景包</h2>\n'
   render_profiles_section
   printf '</section>\n'
 
   printf '<section id="adapters-section">\n'
-  printf '<div class="section-header-row"><h2>软件接入</h2>'
-  printf '<button type="button" id="add-tool-btn" class="mode-toggle-btn btn-primary" onclick="openAddToolWizard()" disabled title="需要本地服务：skillctl dashboard serve">+ 添加平台</button></div>\n'
+  printf '<div class="section-header-row"><h2 data-i18n="sectionAdapters">软件接入</h2>'
+  printf '<button type="button" id="add-tool-btn" class="mode-toggle-btn btn-primary" data-i18n="btnAddTool" onclick="openAddToolWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">+ 添加平台</button></div>\n'
   render_adapters_section
   printf '</section>\n'
 
@@ -792,7 +874,13 @@ var LIVE = window.__DASHBOARD_LIVE__ || null;
 if (LIVE) {
   var subtitleEl = document.getElementById('build-subtitle');
   if (subtitleEl) {
-    subtitleEl.textContent = '本地服务已连接 · 每次刷新页面自动重新生成，激活/停用/删除按钮点击即生效';
+    // 不直接在这里写死中文塞进 textContent——这段代码跑在 I18N/t()/
+    // applyLanguage() 定义之前（脚本靠前的位置，LIVE 检测本来就要尽早
+    // 跑），这时候调用 t() 会因为 I18N 这个 var 还没执行到赋值那行而
+    // 读到 undefined。只打上 data-i18n 标记，实际文字交给脚本末尾统一
+    // 跑一次的 applyLanguage() 去填——那时候 I18N 已经就绪，语言切换时
+    // 也会走同一条路径自动刷新，不用另外写一份逻辑。
+    subtitleEl.dataset.i18n = 'liveSubtitle';
   }
   // GitHub 导入向导需要本地服务真正执行 clone + skillctl import-github——
   // 静态快照没法预览一个还没下载下来的仓库，所以这个按钮只在 LIVE 下开放，
@@ -816,6 +904,11 @@ if (LIVE) {
   if (atBtn) {
     atBtn.disabled = false;
     atBtn.title = '';
+  }
+  var bkBtn = document.getElementById('backup-sync-btn');
+  if (bkBtn) {
+    bkBtn.disabled = false;
+    bkBtn.title = '';
   }
 }
 function applyFilters() {
@@ -852,16 +945,24 @@ function copyCommand(btn, text) {
 var selectionMode = null;
 var selected = {};
 var MODE_BUTTON_IDS = { delete: 'delete-mode-btn', activate: 'activate-mode-btn', deactivate: 'deactivate-mode-btn' };
-var MODE_LABELS = { delete: '删除模式', activate: '常驻模式', deactivate: '移入仓库模式' };
+// 文字本身现在从 I18N 字典按语言取（见下面 MODE_LABEL_KEYS/t()），这几个
+// 只保留"mode -> key 名字"这层映射，不再直接存中文。MODE_TARGET_STATUS
+// 例外：它比对的是表格行的 data-status，那个属性本身没有汉化（见文件顶部
+// I18N 那段注释——表格内容不在翻译范围内），所以这里必须继续是中文字面量，
+// 不能跟着换成 key。
+var MODE_LABEL_KEYS = { delete: 'modeDelete', activate: 'modeActivate', deactivate: 'modeDeactivate' };
 var MODE_TARGET_STATUS = { activate: '仓库中', deactivate: '已激活' }; // delete 没有限制，不在这里列
-var STATIC_CONFIRM_TEXT = { delete: '复制删除命令', activate: '复制激活命令', deactivate: '复制移入仓库命令' };
-var LIVE_CONFIRM_TEXT = { delete: '删除到废纸篓', activate: '激活', deactivate: '移动到仓库中' };
+function modeLabel(mode) { return t(MODE_LABEL_KEYS[mode]); }
+function confirmText(mode) {
+  var prefix = LIVE ? 'confirmLive' : 'confirmStatic';
+  return t(prefix + mode.charAt(0).toUpperCase() + mode.slice(1));
+}
 function toggleSelectionMode(mode) {
   var nextMode = (selectionMode === mode) ? null : mode;
   if (selectionMode) {
     var prevBtn = document.getElementById(MODE_BUTTON_IDS[selectionMode]);
     prevBtn.classList.remove('active');
-    prevBtn.textContent = MODE_LABELS[selectionMode];
+    prevBtn.textContent = modeLabel(selectionMode);
     document.getElementById('skills-section').classList.remove('mode-' + selectionMode);
   }
   selected = {};
@@ -881,11 +982,11 @@ function toggleSelectionMode(mode) {
   if (selectionMode) {
     var btn = document.getElementById(MODE_BUTTON_IDS[selectionMode]);
     btn.classList.add('active');
-    btn.textContent = '退出' + MODE_LABELS[selectionMode];
+    btn.textContent = t('modeExitPrefix') + modeLabel(selectionMode);
     document.getElementById('skills-section').classList.add('mode-' + selectionMode);
     var confirmBtn = document.getElementById('selection-confirm-btn');
     confirmBtn.dataset.mode = selectionMode;
-    confirmBtn.textContent = (LIVE ? LIVE_CONFIRM_TEXT : STATIC_CONFIRM_TEXT)[selectionMode];
+    confirmBtn.textContent = confirmText(selectionMode);
   }
   // 目标状态筛选：进入 activate/deactivate 模式时自动把状态下拉框切到
   // 对应状态，帮用户把不相关的行先隐藏掉；退出模式（含切到 delete）时
@@ -913,7 +1014,7 @@ function onSkillRowClick(row) {
 function updateSelectionBar() {
   var ids = Object.keys(selected);
   document.getElementById('selection-bar').classList.toggle('visible', ids.length > 0);
-  document.getElementById('selection-count').textContent = '已选中 ' + ids.length + ' 项';
+  document.getElementById('selection-count').textContent = t('selectionCount').replace('{n}', ids.length);
 }
 function commandForSelectedId(id) {
   // 跟"软件接入"表格里的复制命令保持一致，用绝对路径而不是裸 skillctl——
@@ -921,11 +1022,12 @@ function commandForSelectedId(id) {
   // 没有，粘贴直接报 "command not found"，这个坑已经在真实环境里踩过。
   var bin = '~/.skill-library/bin/skillctl ';
   if (selectionMode === 'delete') {
-    // 删除 = 先停用（清掉共享货架软链，已经停用则无害地跳过）再把仓库里
-    // 的真身挪进系统废纸篓（可反悔，不是永久 rm）。用 osascript 走 Finder
-    // 删除，跟本机其他地方挪废纸篓的方式保持一致。
-    return bin + 'deactivate ' + id + ' --apply' +
-      '\nosascript -e \'tell application "Finder" to delete POSIX file "\'"$HOME"\'/.skill-library/skills/' + id + '"\'';
+    // 以前这里手写"deactivate + osascript 挪废纸篓"两行，漏了清理
+    // config/aliases.tsv 里那一行记录，删得越多这个文件积攒的死行越多。
+    // skillctl delete 把停用/挪废纸篓/重建 catalog/清 aliases 这四步收进
+    // 一个命令，这里跟本地服务模式（dashboard-server.py 的 /action delete
+    // 分支）现在调用的是同一处实现，不会再各漏一遍。
+    return bin + 'delete ' + id + ' --apply';
   }
   // activate/deactivate 模式下，能被选中的行本身已经被限制成只有目标状态
   // 那一种（见 toggleSelectionMode 的 row-disabled 逻辑），selectionMode
@@ -1016,7 +1118,7 @@ function liveExecuteSelection() {
       return;
     }
     confirmBtn.disabled = false;
-    confirmBtn.textContent = LIVE_CONFIRM_TEXT[selectionMode];
+    confirmBtn.textContent = confirmText(selectionMode);
     showActionToast('完成 ' + (results.length - failed.length) + ' 项，失败 ' + failed.length + ' 项：' +
       failed.map(function (f) { return f.id + '(' + (f.error || '') + ')'; }).join('、'));
   }
@@ -1035,6 +1137,37 @@ function copySelectionCommand() {
     ? '已复制，请粘贴到终端执行。会让 Claude Code、Cursor 等所有已连接的工具都不再能用它，并把仓库里的文件挪进废纸篓。'
     : '已复制，请粘贴到终端执行。';
   showActionToast(message);
+}
+// 备份同步：POST /backup，服务端跑 skillctl backup sync --apply。失败原因
+// 一律用 alert() 展示，不用 3 秒自动消失的 toast——这是实际改数据、连
+// 网络的操作，出错原因（同一 Skill 冲突、gh/网络问题等）值得让用户读完
+// 再关，之前只有"冲突"两个字命中才走 alert、其它失败走 toast，容易在
+// toast 消失前没看清就以为点了没反应。成功则跟其它一键操作一样刷新页
+// 面，让四张统计卡片和这张备份卡片都拿到最新状态。
+function runBackupSync() {
+  if (!LIVE) return;
+  var btn = document.getElementById('backup-sync-btn');
+  btn.disabled = true;
+  var originalLabel = btn.textContent;
+  btn.textContent = '同步中…';
+  fetch('/backup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: LIVE.token, action: 'sync' })
+  }).then(function (r) { return r.json(); }).then(function (data) {
+    if (data.ok) {
+      showActionToast('同步完成，已推送到远端，即将刷新页面…');
+      setTimeout(function () { location.reload(); }, 900);
+      return;
+    }
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    alert('同步到云端失败：\n\n' + (data.error || '未知错误'));
+  }).catch(function (e) {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    alert('同步到云端失败：\n\n' + String(e));
+  });
 }
 function showActionToast(message) {
   var toast = document.getElementById('action-toast');
@@ -1064,6 +1197,134 @@ function updateThemeSwitchUI() {
   });
 }
 updateThemeSwitchUI();
+
+// 中英切换——范围明确限定在"界面框架"：侧边栏、顶部、统计卡片、Skill 列表
+// 上方的搜索/筛选/操作按钮、表头、选中操作条。不包括：表格里每一行的实际
+// 内容（Skill 名称、简介、状态徽标，场景包成员、工具接入方式/命令这些是
+// 数据不是文案）、三个向导弹窗（GitHub 导入/本地拖拽导入/添加平台）内部
+// 文字、以及 toast/alert/confirm 这类运行时提示——这些保持中文，是跟用户
+// 明确对齐过的范围，不是漏翻，以后要扩大范围再加。
+var I18N = {
+  brandTitle: { zh: 'Skill 仓库', en: 'Skill Library' },
+  brandSubtitle: { zh: '本地工作台', en: 'Local Workbench' },
+  navOverview: { zh: '总览', en: 'Overview' },
+  navSkills: { zh: 'Skill 列表', en: 'Skills' },
+  navProfiles: { zh: '场景包', en: 'Profiles' },
+  navAdapters: { zh: '软件接入', en: 'Tools' },
+  h1Title: { zh: 'Skill 中央仓库', en: 'Skill Library' },
+  copyBtn: { zh: '复制', en: 'Copy' },
+  genAtPre: { zh: '生成时间：', en: 'Generated at: ' },
+  genAtPost: { zh: ' ・ 本页为静态快照，需重新运行 ', en: ' · Static snapshot — rerun ' },
+  genAtPost2: { zh: ' 才会刷新', en: ' to refresh' },
+  liveSubtitle: { zh: '本地服务已连接 · 每次刷新页面自动重新生成，激活/停用/删除按钮点击即生效', en: 'Local server connected · page regenerates on every reload; activate/deactivate/delete buttons apply instantly' },
+  skillFolderPre: { zh: 'Skill 文件夹：', en: 'Skill folder: ' },
+  skillFolderPost: { zh: '（粘贴到 Finder"前往文件夹"可直接跳转，快捷键 Cmd+Shift+G）', en: ' (paste into Finder’s "Go to Folder", ⌘⇧G)' },
+  themeLight: { zh: '日间模式', en: 'Light' },
+  themeDark: { zh: '夜间模式', en: 'Dark' },
+  themeSystem: { zh: '跟随系统', en: 'System' },
+  statTotal: { zh: '全部 Skill', en: 'Total Skills' },
+  statActive: { zh: '已激活', en: 'Active' },
+  statWarehouse: { zh: '仓库中', en: 'In library' },
+  statBackup: { zh: 'GitHub 备份', en: 'GitHub Backup' },
+  backupOffHintPre: { zh: '终端运行 ', en: 'Run ' },
+  backupOffHintPost: { zh: ' 开启', en: ' in a terminal to set up' },
+  backupHint: { zh: '未提交 {dirty} 项・落后远端 {behind} 个提交', en: '{dirty} uncommitted · {behind} behind remote' },
+  sectionSkills: { zh: 'Skill 列表', en: 'Skills' },
+  sectionProfiles: { zh: '场景包', en: 'Profiles' },
+  sectionAdapters: { zh: '软件接入', en: 'Tools' },
+  searchPlaceholder: { zh: '按中文名称、别名或英文 ID 搜索…', en: 'Search by name, alias, or ID…' },
+  filterAll: { zh: '全部状态', en: 'All statuses' },
+  modeActivate: { zh: '常驻模式', en: 'Activate Mode' },
+  modeDeactivate: { zh: '移入仓库模式', en: 'Deactivate Mode' },
+  modeDelete: { zh: '删除模式', en: 'Delete Mode' },
+  modeExitPrefix: { zh: '退出', en: 'Exit ' },
+  confirmStaticActivate: { zh: '复制激活命令', en: 'Copy activate command' },
+  confirmStaticDeactivate: { zh: '复制移入仓库命令', en: 'Copy deactivate command' },
+  confirmStaticDelete: { zh: '复制删除命令', en: 'Copy delete command' },
+  confirmLiveActivate: { zh: '激活', en: 'Activate' },
+  confirmLiveDeactivate: { zh: '移动到仓库中', en: 'Move to library' },
+  confirmLiveDelete: { zh: '删除到废纸篓', en: 'Delete to Trash' },
+  selectionCount: { zh: '已选中 {n} 项', en: '{n} selected' },
+  btnGithubImport: { zh: '从 GitHub 导入', en: 'Import from GitHub' },
+  btnUploadImport: { zh: '本地拖拽导入', en: 'Drag & Drop Import' },
+  btnCheckUpdates: { zh: '检查更新', en: 'Check Updates' },
+  btnBackupSync: { zh: '同步到云端', en: 'Sync to Cloud' },
+  btnAddTool: { zh: '+ 添加平台', en: '+ Add Platform' },
+  tooltipNeedsLive: { zh: '需要本地服务：skillctl dashboard serve', en: 'Requires local server: skillctl dashboard serve' },
+  thStatus: { zh: '状态', en: 'Status' },
+  thName: { zh: '中文名称', en: 'Name' },
+  thId: { zh: '英文 ID', en: 'ID' },
+  thCategory: { zh: '分类', en: 'Category' },
+  thProfiles: { zh: '所属场景包', en: 'Profiles' },
+  thDescription: { zh: '简介', en: 'Description' },
+  thProfileName: { zh: '场景包', en: 'Profile' },
+  thProfileCount: { zh: '数量', en: 'Count' },
+  thProfileMembers: { zh: '成员', en: 'Members' },
+  thTool: { zh: '软件', en: 'Tool' },
+  thToolMode: { zh: '接入方式', en: 'Mode' },
+  thToolCommand: { zh: '安全命令', en: 'Command' },
+  toolDetected: { zh: '已检测', en: 'Detected' },
+  toolResidual: { zh: '可能是残留目录', en: 'Possibly a leftover directory' },
+  toolNotDetected: { zh: '未检测到', en: 'Not detected' },
+  modeNative: { zh: '原生', en: 'Native' },
+  modeLink: { zh: '软链', en: 'Symlink' },
+  toolNativeHint: { zh: '（原生模式，自动共享全局 Skill 目录，无需命令）', en: '(native mode — shares the global Skill directory automatically, no command needed)' }
+};
+function currentLang() {
+  try { return localStorage.getItem('skill-dashboard-lang') === 'en' ? 'en' : 'zh'; } catch (e) { return 'zh'; }
+}
+// 给 JS 里那些原来写死中文字符串的地方（MODE_LABELS 等）用，不依赖 DOM。
+function t(key) {
+  var entry = I18N[key];
+  return entry ? entry[currentLang()] : key;
+}
+function applyLanguage() {
+  var lang = currentLang();
+  document.querySelectorAll('[data-i18n]').forEach(function (el) {
+    el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(function (el) {
+    el.title = t(el.dataset.i18nTitle);
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(function (el) {
+    el.placeholder = t(el.dataset.i18nPlaceholder);
+  });
+  // 带插值的模板（目前只有备份卡片那行"未提交 N 项・落后远端 N 个提交"），
+  // 数字本身来自元素自己的 data-dirty/data-behind，不需要重新请求数据。
+  document.querySelectorAll('[data-i18n-template]').forEach(function (el) {
+    var tpl = t(el.dataset.i18nTemplate);
+    el.textContent = tpl
+      .replace('{dirty}', el.dataset.dirty || '0')
+      .replace('{behind}', el.dataset.behind || '0');
+  });
+  updateSelectionBar();
+  // 选中模式激活时，模式按钮和确认按钮当前显示的是运行时拼出来的文字
+  // （"退出X模式"、"复制XX命令"之类），不在静态 [data-i18n] 覆盖范围内，
+  // 语言切换时要单独刷新，不然会停在切换前那种语言。
+  if (selectionMode) {
+    document.getElementById(MODE_BUTTON_IDS[selectionMode]).textContent = t('modeExitPrefix') + modeLabel(selectionMode);
+    var confirmBtn = document.getElementById('selection-confirm-btn');
+    confirmBtn.textContent = confirmText(selectionMode);
+  }
+}
+function setLangChoice(choice) {
+  try { localStorage.setItem('skill-dashboard-lang', choice); } catch (e) {}
+  if (choice === 'en') {
+    document.documentElement.dataset.lang = 'en';
+  } else {
+    delete document.documentElement.dataset.lang;
+  }
+  applyLanguage();
+  updateLangSwitchUI();
+}
+function updateLangSwitchUI() {
+  var current = currentLang();
+  document.querySelectorAll('.lang-switch-btn').forEach(function (btn) {
+    btn.classList.toggle('active', btn.dataset.langChoice === current);
+  });
+}
+applyLanguage();
+updateLangSwitchUI();
 
 // ---- GitHub 导入向导：1 仓库地址 → 2 预览 → 3 确认 → 4 结果 ----
 // 只在 LIVE 下可用（按钮本身默认 disabled，只有 LIVE 分支才会启用），因为
@@ -1165,7 +1426,7 @@ function renderGithubWizard() {
         }).join('') +
         '</div>' +
         '<label class="gh-checkbox-row"><input type="checkbox" id="gh-batch-activate"' + (ghState.batchActivate ? ' checked' : '') + '> 导入后立即激活</label>' +
-        '<label class="gh-checkbox-row"><input type="checkbox" id="gh-batch-replace"' + (ghState.batchReplace ? ' checked' : '') + '> 仓库里已有同名 Skill 时替换（旧版本自动移入废纸篓，可反悔）</label>' +
+        '<label class="gh-checkbox-row"><input type="checkbox" id="gh-batch-replace"' + (ghState.batchReplace ? ' checked' : '') + '> 仓库里已有同名 Skill 时替换（旧版本自动移入废纸篓）</label>' +
         '<div class="gh-actions"><button type="button" class="gh-btn gh-btn-secondary" onclick="ghState.step = 1; renderGithubWizard();">上一步</button>' +
         '<button type="button" class="gh-btn gh-btn-primary"' + (selCount ? '' : ' disabled') + ' onclick="ghRunBatchImport()">导入选中的 ' + selCount + ' 个</button></div>';
     } else if (conflictHint) {
@@ -1199,7 +1460,7 @@ function renderGithubWizard() {
       (ghState.path ? '（子路径 ' + ghEscape(ghState.path) + '）' : '') +
       (ghState.ref ? '，ref ' + ghEscape(ghState.ref) : '') + '</p>' +
       '<label class="gh-checkbox-row"><input type="checkbox" id="gh-activate"' + (ghState.activate ? ' checked' : '') + '> 导入后立即激活</label>' +
-      '<label class="gh-checkbox-row"><input type="checkbox" id="gh-replace"' + (ghState.replace ? ' checked' : '') + '> 仓库里已有同名 Skill 时替换（旧版本自动移入废纸篓，可反悔，不是永久删除）</label>' +
+      '<label class="gh-checkbox-row"><input type="checkbox" id="gh-replace"' + (ghState.replace ? ' checked' : '') + '> 仓库里已有同名 Skill 时替换（旧版本自动移入废纸篓，不是永久删除）</label>' +
       '<div class="gh-actions"><button type="button" class="gh-btn gh-btn-secondary" onclick="ghState.step = 2; renderGithubWizard();">上一步</button>' +
       '<button type="button" class="gh-btn gh-btn-primary" id="gh-confirm-btn" onclick="ghDoConfirm()">确认导入</button></div>';
   } else if (ghState.step === 4) {
@@ -1444,7 +1705,7 @@ function renderUploadWizard() {
     body.innerHTML =
       '<p class="gh-modal-subtitle" style="margin-bottom:12px;">确认导入：' + ghEscape(upState.pickedName) + '</p>' +
       '<label class="gh-checkbox-row"><input type="checkbox" id="up-activate"' + (upState.activate ? ' checked' : '') + '> 导入后立即激活</label>' +
-      '<label class="gh-checkbox-row"><input type="checkbox" id="up-replace"' + (upState.replace ? ' checked' : '') + '> 仓库里已有同名 Skill 时替换（旧版本自动移入废纸篓，可反悔，不是永久删除）</label>' +
+      '<label class="gh-checkbox-row"><input type="checkbox" id="up-replace"' + (upState.replace ? ' checked' : '') + '> 仓库里已有同名 Skill 时替换（旧版本自动移入废纸篓，不是永久删除）</label>' +
       '<div class="gh-actions"><button type="button" class="gh-btn gh-btn-secondary" onclick="upState.step = 2; renderUploadWizard();">上一步</button>' +
       '<button type="button" class="gh-btn gh-btn-primary" id="up-confirm-btn" onclick="upDoConfirm()">确认导入</button></div>';
   } else if (upState.step === 4) {
