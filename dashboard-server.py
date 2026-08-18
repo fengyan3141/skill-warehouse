@@ -102,6 +102,10 @@ SKILLS_DIR = os.path.join(SKILL_LIBRARY_ROOT, "skills")
 # 这个量级基本可以确定是拖错了目录（比如整个项目、整个 Downloads）。
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_UPLOAD_FILES = 500
+# 一次拖拽/上传里最多认多少个 Skill——同样不是安全边界，只是防呆：一次
+# 找到几十上百个 SKILL.md 基本可以确定是拖错了目录（比如整个仓库根目录），
+# 而不是真的要批量收编这么多 Skill。
+MAX_UPLOAD_SKILLS = 20
 TOKEN = secrets.token_urlsafe(24)
 ACTIONS = ("activate", "deactivate", "delete")
 TOOL_ACTIONS = ("connect",)
@@ -215,20 +219,38 @@ def stage_zip_upload(staging_dir, zip_b64):
             shutil.copyfileobj(src, out)
 
 
-def find_skill_root(staging_dir):
+def find_skill_roots(staging_dir):
     # 前端拖文件夹进来时，webkitGetAsEntry 通常会带着文件夹名这一层
     # （比如 my-skill/SKILL.md 而不是直接 SKILL.md），zip 打包时也常见
-    # 同样的结构——SKILL.md 不在根目录就再往下找一层，找不到才算失败。
+    # 同样的结构——SKILL.md 不在根目录就再往下找。
+    #
+    # 单 Skill 是最常见的情形，直接短路返回，不进入下面的批量扫描——避免
+    # 一个 Skill 自己目录内部恰好带着一个叫 SKILL.md 的示例/模板文件时被
+    # 误当成"里面还嵌了一个 Skill"。
     if os.path.isfile(os.path.join(staging_dir, "SKILL.md")):
-        return staging_dir
-    try:
-        entries = [e for e in os.listdir(staging_dir) if not e.startswith(".")]
-    except OSError:
-        return None
-    dirs = [e for e in entries if os.path.isdir(os.path.join(staging_dir, e))]
-    if len(dirs) == 1 and os.path.isfile(os.path.join(staging_dir, dirs[0], "SKILL.md")):
-        return os.path.join(staging_dir, dirs[0])
-    return None
+        return [staging_dir]
+    # 批量情形有两种输入，落到 staging_dir 里长得一模一样，用同一套扫描
+    # 处理，不用区分前端到底是"一次拖了好几个 Skill 文件夹"还是"一个包
+    # 里装了好几个 Skill 子目录"：跟 skillctl import-github 检测"多 Skill
+    # 仓库"用的同一个思路（find -maxdepth 4），找到一个 SKILL.md 就不再往
+    # 它内部继续找（避免把某个 Skill 自己 references/ 目录里的示例文件
+    # 误认成又一层嵌套的 Skill）。
+    found = []
+    for root, dirs, files in os.walk(staging_dir):
+        dirs.sort()
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        rel = os.path.relpath(root, staging_dir)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > 4:
+            dirs[:] = []
+            continue
+        if any(name.lower() == "skill.md" for name in files):
+            found.append(root)
+            dirs[:] = []
+            continue
+        if len(found) > MAX_UPLOAD_SKILLS:
+            break
+    return found
 
 
 def build_dashboard():
@@ -449,27 +471,56 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({"ok": False, "error": "解析上传内容失败：%s" % e}, ensure_ascii=False))
                 return
 
-            skill_root = find_skill_root(staging_dir)
-            if not skill_root:
-                self._send(400, json.dumps({"ok": False, "error": "没找到 SKILL.md（根目录下，或唯一一层子目录下都没有）"}, ensure_ascii=False))
+            skill_roots = find_skill_roots(staging_dir)
+            if not skill_roots:
+                self._send(400, json.dumps({"ok": False, "error": "没找到 SKILL.md（根目录，或往下最多 4 层都没有）"}, ensure_ascii=False))
+                return
+            if len(skill_roots) > MAX_UPLOAD_SKILLS:
+                self._send(400, json.dumps({"ok": False, "error": "一次找到 %d 个 SKILL.md，超过单批上限 %d，像是拖错了目录" % (len(skill_roots), MAX_UPLOAD_SKILLS)}, ensure_ascii=False))
                 return
 
-            args = ["import", skill_root]
-            if step == "confirm":
-                if req.get("replace"):
-                    args += ["--replace"]
-                if req.get("activate"):
-                    args += ["--activate"]
-                args += ["--apply"]
+            replace = bool(req.get("replace"))
+            activate = bool(req.get("activate"))
+            # 每个找到的 Skill 目录各自独立调一次 cmd_import，逐个落地，不
+            # 整体回滚——批量里某一个因为哈希冲突需要 --replace 才能失败，
+            # 不该连带其它已经能正常导入的一起卡住；每个结果都会原样带回去，
+            # 失败的那些用户能看到具体原因，自己决定要不要勾上"替换"重试。
+            results = []
+            overall_ok = True
+            for root in skill_roots:
+                args = ["import", root]
+                if step == "confirm":
+                    if replace:
+                        args += ["--replace"]
+                    if activate:
+                        args += ["--activate"]
+                    args += ["--apply"]
+                try:
+                    rc, out, err = run_skillctl(*args, timeout=30)
+                except Exception as e:
+                    results.append((False, "（执行失败：%s）" % e))
+                    overall_ok = False
+                    continue
+                ok = rc == 0
+                overall_ok = overall_ok and ok
+                output = (out or "") + (("\n" + err) if err else "")
+                results.append((ok, output.strip()))
 
-            try:
-                rc, out, err = run_skillctl(*args, timeout=30)
-            except Exception as e:
-                self._send(500, json.dumps({"ok": False, "error": str(e)}))
+            if len(skill_roots) == 1:
+                # 单 Skill 是最常见的情形，输出格式跟改这个函数之前完全
+                # 一样，不因为多了批量能力就多套一层"共 1 个"之类的措辞。
+                ok, output = results[0]
+                self._send(200, json.dumps({"ok": ok, "output": output}, ensure_ascii=False))
                 return
 
-            output = (out or "") + (("\n" + err) if err else "")
-            self._send(200, json.dumps({"ok": rc == 0, "output": output.strip()}, ensure_ascii=False))
+            lines = []
+            for root, (ok, output) in zip(skill_roots, results):
+                label = os.path.relpath(root, staging_dir)
+                if label == ".":
+                    label = os.path.basename(root.rstrip(os.sep)) or root
+                lines.append("--- %s%s ---" % (label, "" if ok else "（失败）"))
+                lines.append(output)
+            self._send(200, json.dumps({"ok": overall_ok, "output": "\n".join(lines)}, ensure_ascii=False))
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
 

@@ -260,7 +260,7 @@ skillctl dashboard serve
 
 - **常驻模式 / 移入仓库模式 / 删除模式**：跟静态快照一样是三选一的批量勾选，但点确认后直接执行；删除模式会把 Skill 目录整个挪进系统废纸篓（"最近删除"，不是本项目自己的归档区，可以用系统自带的恢复方式找回）。同一批打包导入的 Skill 如果只选中了一部分，会先弹窗提示同批还有哪些没选，问要不要一起处理。
 - **从 GitHub 导入**：输入仓库 URL（也认 `.../tree/<ref>/<子路径>` 这种浏览器地址栏形式，自动拆出 ref 和子路径），先克隆到临时目录做只读预览（声明的 name/description、带没带可执行脚本），确认后才真正落地；仓库里有多个 Skill 时会列出所有候选路径，支持勾选多个一次性批量导入，导入中的每一项独立显示进度。
-- **本地拖拽导入**：把一个 Skill 文件夹或打包好的 `.zip` 直接拖进浏览器，收编进仓库。
+- **本地拖拽导入**：把一个或多个 Skill 文件夹、或者打包好的 `.zip` 直接拖进浏览器，收编进仓库；文件夹/zip 内部本身装着多个 Skill 子目录时也会一次性全部识别出来批量导入，某一个因为仓库里已有同名内容而失败不影响其它已经能正常导入的（点击选择框走系统文件夹选择器时同样支持多选平级文件夹）。
 - **检查更新**：对所有用 `track-source`/`import-github` 登记过来源的 Skill，批量检查上游是否有新内容。
 - **+ 添加平台**：注册内置十个适配器之外的工具，补一行 `config/adapters/tools.tsv`。
 - **同步到云端**：顶部"GitHub 备份"卡片上的按钮，效果等同于 `skillctl backup sync --apply`，前提是已经跑过一次 `skillctl backup init --apply`；没配置过备份仓库时卡片会提示去终端跑 `backup init`，不提供面板内建仓库的入口（建仓库要求 `gh` 已登录，属于一次性设置，留在终端做）。
@@ -303,7 +303,7 @@ skillctl dashboard serve
 ## 发布前检查清单（维护者自查）
 
 - [x] 仓库名（skill-warehouse）与命令名（skillctl）分离，两者独立检索均未发现直接冲突
-- [x] 全部脚本通过 `shellcheck`（v2 复查：新增的 `dashboard-server.py` 装机路径也过了 Python 语法检查；v3 复查：新代码过 `shellcheck` 时抓出一个真实 bug——`trash_path()` 被无意中定义了两份，同名后定义悄悄覆盖了 `import --replace` 本来在用的那份，已合并成一份共用实现，`work/run_skill_library_tests.sh` 18 套件 643 条断言全过）
+- [x] 全部脚本通过 `shellcheck`（v2 复查：新增的 `dashboard-server.py` 装机路径也过了 Python 语法检查；v3 复查：新代码过 `shellcheck` 时抓出一个真实 bug——`trash_path()` 被无意中定义了两份，同名后定义悄悄覆盖了 `import --replace` 本来在用的那份，已合并成一份共用实现，`work/run_skill_library_tests.sh` 18 套件 643 条断言全过；v3 本地拖拽批量导入复查：`build-dashboard.sh` 过 `shellcheck` 干净，`dashboard-server.py` 走 Python 语法检查，`work/run_skill_library_tests.sh` 642/643 通过——剩下那 1 条失败和 1 个异常退出的套件在改动前的 `main` 分支上原样存在，跟这次改动无关，本次复查未处理，留给后续单独排查）
 - [x] 干净账户（无既有 `~/.skill-library`）走通一遍上面的 Quickstart（v2 复查：含新增的 `dashboard-server.py` 是否被 `install-manager.sh` 正确装上）
 - [x] 文档描述的行为与代码实际行为逐条核对一致（v2 复查：`archive`/`restore` 已从代码里整体移除，README 不再提及；命令参考、面板章节按当前真实行为重写。v3 复查：`deactivate` 段落原本写着"没有 CLI 级别的永久删除命令"，`delete` 命令加入后这句话已经是假的，已更新；场景式帮助的场景包示例原来写着 `core/aipm/frameflow/stock/lark`，但随包 `config/profiles/` 下只有 `core`，其余四个是维护者私人仓库的场景包名、不会存在于任何新装用户的环境里，已改成指向 `config/profiles/` 目录本身，不再列举不存在的名字）
 - [ ] 首次公开发布前，把 `LICENSE` 里的版权署名换成你希望使用的名义（默认写的是 "skill-warehouse contributors"）

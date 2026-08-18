@@ -831,7 +831,7 @@ HTML_HEAD
   printf '<div class="gh-modal-overlay hidden" id="up-modal-overlay">\n'
   printf '<div class="gh-modal">\n'
   printf '<div class="gh-modal-header"><h2>本地拖拽导入</h2><button type="button" class="gh-modal-close" onclick="closeUploadWizard()">×</button></div>\n'
-  printf '<p class="gh-modal-subtitle">把本地 Skill 文件夹或打包好的 .zip 直接拖进来收编进中央仓库</p>\n'
+  printf '<p class="gh-modal-subtitle">把一个或多个本地 Skill 文件夹、或打包好的 .zip 直接拖进来收编进中央仓库（文件夹/zip 内部也可以装着多个 Skill 子目录）</p>\n'
   printf '<div class="gh-steps" id="up-steps"></div>\n'
   printf '<div id="up-body"></div>\n'
   printf '</div>\n</div>\n'
@@ -1715,8 +1715,8 @@ function renderUploadWizard() {
   var body = document.getElementById('up-body');
   if (upState.step === 1) {
     body.innerHTML =
-      '<div class="up-dropzone" id="up-dropzone">拖一个 Skill 文件夹或打包好的 .zip 到这里<div class="up-dropzone-hint">或者点这里选择文件夹 / zip 文件</div></div>' +
-      '<input type="file" id="up-folder-input" webkitdirectory style="display:none">' +
+      '<div class="up-dropzone" id="up-dropzone">拖一个或多个 Skill 文件夹、或打包好的 .zip 到这里<div class="up-dropzone-hint">或者点这里选择文件夹 / zip 文件（可多选文件夹）</div></div>' +
+      '<input type="file" id="up-folder-input" webkitdirectory multiple style="display:none">' +
       '<input type="file" id="up-zip-input" accept=".zip" style="display:none">' +
       (upState.pickedName ? '<p class="up-picked-name">已选择：' + ghEscape(upState.pickedName) + '</p>' : '') +
       '<div class="gh-actions"><button type="button" class="gh-btn gh-btn-secondary" onclick="closeUploadWizard()">取消</button></div>';
@@ -1766,30 +1766,46 @@ function upHandleDrop(e) {
   e.currentTarget.classList.remove('dragover');
   var items = e.dataTransfer.items;
   if (!items || !items.length) return;
-  // 只处理拖进来的第一个条目——一次拖一个 Skill 文件夹或一个 zip，拖多个
-  // 只认第一个，避免"该合并成一个 Skill 还是分开导入"这种歧义。
-  var entry = items[0].webkitGetAsEntry ? items[0].webkitGetAsEntry() : null;
-  if (entry && entry.isDirectory) {
-    upReadDirectoryEntry(entry, '').then(function (files) {
-      upState.kind = 'folder';
-      upState.files = files;
-      upState.pickedName = entry.name + '/（' + files.length + ' 个文件）';
-      upState.step = 2;
-      renderUploadWizard();
-      upDoPreview();
-    }).catch(function (err) {
-      alert('读取文件夹失败：' + err);
-    });
-    return;
+  // 一次可以拖多个 Skill 文件夹进来（各自根目录下有 SKILL.md，或者内部
+  // 又装着好几个 Skill 子目录，服务端 find_skill_roots 统一扫描处理，这
+  // 里不用关心具体分了几层）。zip 仍然只认一个——多个压缩包一起解到同一
+  // 个暂存目录，条目名冲突时谁盖谁不确定，不如让用户一个个拖；zip 内部
+  // 本来就可以自己装多个 Skill，批量能力不会因此变弱。
+  var entries = [];
+  for (var i = 0; i < items.length; i++) {
+    var entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+    if (entry) entries.push(entry);
   }
-  var file = items[0].getAsFile ? items[0].getAsFile() : null;
-  if (file) {
-    if (file.name && file.name.toLowerCase().endsWith('.zip')) {
+  if (entries.length === 1 && entries[0].isFile) {
+    var file = items[0].getAsFile ? items[0].getAsFile() : null;
+    if (file && file.name && file.name.toLowerCase().endsWith('.zip')) {
       upHandleZipFile(file);
     } else {
-      alert('只支持拖一个 Skill 文件夹，或者一个打包好的 .zip 文件');
+      alert('只支持拖 Skill 文件夹（可以一次拖多个），或者一个打包好的 .zip 文件');
     }
+    return;
   }
+  if (!entries.length || !entries.every(function (en) { return en.isDirectory; })) {
+    alert('只支持拖 Skill 文件夹（可以一次拖多个），或者一个打包好的 .zip 文件');
+    return;
+  }
+  Promise.all(entries.map(function (en) { return upReadDirectoryEntry(en, ''); })).then(function (groups) {
+    var files = groups.reduce(function (a, b) { return a.concat(b); }, []);
+    upState.kind = 'folder';
+    upState.files = files;
+    upState.pickedName = upDescribePicked(entries.map(function (en) { return en.name; }), files.length);
+    upState.step = 2;
+    renderUploadWizard();
+    upDoPreview();
+  }).catch(function (err) {
+    alert('读取文件夹失败：' + err);
+  });
+}
+// 拖/选了几个 Skill 文件夹就展示几个名字，单个的话保持原来"root/（N 个
+// 文件）"的措辞不变——批量能力不该让最常见的单 Skill 场景看起来更啰嗦。
+function upDescribePicked(names, fileCount) {
+  if (names.length === 1) return names[0] + '/（' + fileCount + ' 个文件）';
+  return names.length + ' 个文件夹（' + names.join('、') + '，合计 ' + fileCount + ' 个文件）';
 }
 function upHandleFolderFileList(fileList) {
   if (!fileList || !fileList.length) return;
@@ -1804,8 +1820,15 @@ function upHandleFolderFileList(fileList) {
   })).then(function (files) {
     upState.kind = 'folder';
     upState.files = files;
-    var rootName = (fileList[0].webkitRelativePath || fileList[0].name).split('/')[0];
-    upState.pickedName = rootName + '/（' + files.length + ' 个文件）';
+    // webkitdirectory + multiple 让浏览器允许一次选中几个平级文件夹，选出
+    // 来的 FileList 会把它们的内容混在一起，按每个文件相对路径的第一段
+    // 还原出各自的根目录名，去重后就是这次选中了哪几个文件夹。
+    var rootNames = [];
+    Array.prototype.forEach.call(fileList, function (f) {
+      var top = (f.webkitRelativePath || f.name).split('/')[0];
+      if (rootNames.indexOf(top) === -1) rootNames.push(top);
+    });
+    upState.pickedName = upDescribePicked(rootNames, files.length);
     upState.step = 2;
     renderUploadWizard();
     upDoPreview();
