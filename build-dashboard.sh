@@ -108,7 +108,7 @@ render_backup_card() {
   # 传达，不再用一个大词复述一遍。
   printf '<div class="stat-card stat-backup%s">\n<div class="stat-card-body">\n' "$extra_class"
   printf '<span class="stat-label" data-i18n="statBackup">GitHub 备份</span>\n'
-  printf '<p class="stat-hint" data-i18n-template="backupHint" data-dirty="%s" data-behind="%s">未提交 %s 项・落后远端 %s 个提交</p>\n' \
+  printf '<p class="stat-hint" data-i18n-template="backupHint" data-dirty="%s" data-behind="%s">未提交 %s 项・落后云端 %s 个提交</p>\n' \
     "$(html_escape "$dirty")" "$(html_escape "$behind")" "$(html_escape "$dirty")" "$(html_escape "$behind")"
   printf '<button type="button" id="backup-sync-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnBackupSync" onclick="runBackupSync()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">同步到云端</button>\n'
   printf '</div>\n</div>\n'
@@ -1264,7 +1264,7 @@ var I18N = {
   statBackup: { zh: 'GitHub 备份', en: 'GitHub Backup' },
   backupOffHintPre: { zh: '终端运行 ', en: 'Run ' },
   backupOffHintPost: { zh: ' 开启', en: ' in a terminal to set up' },
-  backupHint: { zh: '未提交 {dirty} 项・落后远端 {behind} 个提交', en: '{dirty} uncommitted · {behind} behind remote' },
+  backupHint: { zh: '未提交 {dirty} 项・落后云端 {behind} 个提交', en: '{dirty} uncommitted · {behind} behind cloud' },
   sectionSkills: { zh: 'Skill 列表', en: 'Skills' },
   sectionProfiles: { zh: '场景包', en: 'Profiles' },
   sectionAdapters: { zh: '软件接入', en: 'Tools' },
@@ -1327,7 +1327,7 @@ function applyLanguage() {
   document.querySelectorAll('[data-i18n-placeholder]').forEach(function (el) {
     el.placeholder = t(el.dataset.i18nPlaceholder);
   });
-  // 带插值的模板（目前只有备份卡片那行"未提交 N 项・落后远端 N 个提交"），
+  // 带插值的模板（目前只有备份卡片那行"未提交 N 项・落后云端 N 个提交"），
   // 数字本身来自元素自己的 data-dirty/data-behind，不需要重新请求数据。
   document.querySelectorAll('[data-i18n-template]').forEach(function (el) {
     var tpl = t(el.dataset.i18nTemplate);
