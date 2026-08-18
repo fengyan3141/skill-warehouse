@@ -21,6 +21,7 @@ skillctl tools connect claude-code --apply  # 把当前激活集合同步给 Cla
 skillctl import-github <GitHub URL> --activate --apply  # 从 GitHub 仓库直接收编一个 Skill
 skillctl doctor                          # 体检：断链、工具检测、一致性等，只读
 skillctl dashboard serve                 # 起本地面板，浏览器里点按钮直接生效
+skillctl backup init --apply             # 把仓库备份到私有 GitHub 仓库，换机器用 --remote 恢复
 skillctl eject --apply                   # 不想用了？把软链换成独立真实拷贝，随时退出
 ```
 
@@ -110,9 +111,9 @@ skillctl profile use core --apply
 
 ## 命令参考
 
-只读查询：`list` / `search <关键词>` / `status` / `tools detect` / `dashboard open` / `doctor` / `lint` / `check-updates [id]` / `export <id> [--output <绝对路径>]`
+只读查询：`list` / `search <关键词>` / `status` / `tools detect` / `dashboard open` / `doctor` / `lint` / `check-updates [id]` / `export <id> [--output <绝对路径>]` / `backup status`
 
-会改动状态（默认只预演，加 `--apply` 才真正执行）：`activate` / `deactivate` / `profile use` / `import` / `import-github` / `track-source` / `tools connect` / `tools disconnect` / `dashboard build` / `eject`
+会改动状态（默认只预演，加 `--apply` 才真正执行）：`activate` / `deactivate` / `delete` / `profile use` / `import` / `import-github` / `track-source` / `tools connect` / `tools disconnect` / `dashboard build` / `eject` / `backup init` / `backup sync`
 
 不带参数运行 `skillctl` 看场景式速查，`skillctl help` 看完整参数说明。
 
@@ -125,6 +126,7 @@ skillctl import-github https://github.com/owner/repo --path skills/some-skill --
 skillctl track-source existing-skill-id https://github.com/owner/repo --apply           # 给已有 Skill 补登记来源，供 check-updates 用
 skillctl check-updates            # 检查所有登记过来源的 Skill 是否有上游更新（不联网改动任何东西）
 skillctl deactivate skill-name --apply
+skillctl delete skill-name --apply                             # 停用 + 挪进系统废纸篓 + 清理 catalog/aliases 记录
 skillctl export skill-name                                    # 默认输出到 ~/Desktop/skill-export-skill-name/
 skillctl export skill-name --output /absolute/path/to/somewhere
 ```
@@ -135,7 +137,7 @@ skillctl export skill-name --output /absolute/path/to/somewhere
 
 `import-github` 复用 `import` 的同一套安全检查（哈希去重、`--replace` 先把旧版本挪进废纸篓、`--activate`），多加一步：clone 到临时目录、定位 `SKILL.md`、给一段来源预览（声明的 name/description、带没带可执行脚本）供你确认后再落地。仓库根目录没有 `SKILL.md` 时会自动找出仓库里所有真正挂着 `SKILL.md` 的目录（不管套了几层分类）列成候选，提示你用 `--path` 指定；链接里混进的零宽空格、全角标点会被自动规整，不会因为这类不可见字符直接报"链接格式不对"或悄悄拼错 owner/repo。
 
-`deactivate` 只移除受管软链，Skill 本身还在仓库里（状态变回"仓库中"）。**没有 CLI 级别的永久删除命令**——想要连仓库里的内容一起清掉，要么手动删除 `skills/<id>/` 目录，要么用 `dashboard serve`（本地服务模式）里的"删除模式"，那边点了按钮之后会把 Skill 目录整个挪进系统废纸篓（不是本项目自己的归档区，用系统自带的"最近删除"/Trash 找回）。
+`deactivate` 只移除受管软链，Skill 本身还在仓库里（状态变回"仓库中"）。想要连仓库里的内容一起清掉，用 `skillctl delete <id> --apply`：停用 + 把 `skills/<id>/` 整个挪进系统废纸篓（不是本项目自己的归档区，用系统自带的"最近删除"/Trash 找回，不是永久 `rm -rf`）+ 重建 `catalog.tsv` + 清掉 `config/aliases.tsv` 里对应的行。`dashboard serve` 本地服务模式的"删除模式"和面板静态模式复制出来的命令，现在都是调用这同一个 `skillctl delete`。
 
 ### 体检与内容质量：`doctor` / `lint`
 
@@ -154,6 +156,21 @@ skillctl eject --apply
 ```
 
 把所有已连接工具目录（含 `~/.agents/skills` 本身）里受管的软链，逐个替换成当前指向内容的真实拷贝。`--apply` 前会先把将改动的目录备份到 `~/.skill-library/eject-backups/<时间戳>/`，备份失败直接中止、不碰任何文件。这基本等于永久脱离 skillctl 管理——物化之后各工具目录变成互相独立的静态副本，不再随激活状态自动同步。不会改动不归属仓库的外部软链或已经存在的真实目录。
+
+### 跨机器备份：`backup`
+
+```bash
+skillctl backup init --apply                                        # 全新建一个私有 GitHub 仓库，把当前仓库推上去
+skillctl backup init --remote https://github.com/<你>/<仓库> --apply  # 换新机器：从已有备份克隆恢复
+skillctl backup status                                               # 只读：本地是否有未提交改动、跟远端差几个提交
+skillctl backup sync --apply                                         # 提交本地改动、拉取远端改动、推送
+```
+
+给 `~/.skill-library` 配一个私有 GitHub 仓库，`backup init` 之外都不需要 `gh`（GitHub CLI）以外的额外依赖，但建仓库这步需要先 `gh auth login`。默认排除 `.venv`/`__pycache__`/`node_modules`/`dashboard/` 等本机产物；Skill 如果自带独立 `.git`（比如 `import-github` 时连着克隆下来的），会被重命名成 `.git.bak` 保留、不进备份——否则会被父仓库当成断链的 submodule，内容根本不会被追踪。
+
+`backup sync` 不是常驻自动同步，是手动触发的 push/pull。如果同一个 Skill 目录本地和远端都改过，合并会在这一步停下、按整个目录列出冲突（不是逐行 diff——Skill 内容大多是成段的 Markdown，逐行合并容易把两份不相关的改动拼出语义错误的结果），给出 `git checkout --ours/--theirs` 的具体处理命令，交给你手动二选一，不自动帮你决定该留哪边。
+
+`dashboard serve` 本地服务模式下，顶部统计卡片有一张"GitHub 备份"卡片，带一个同步按钮，效果等同于 `backup sync --apply`；静态快照模式下这颗按钮禁用，用终端命令代替。
 
 ## 低上下文路由（实验性）
 
@@ -220,7 +237,7 @@ trae-cn	TraeCode CN	link	~/.trae-cn/skills	.trae-cn/skills		Trae CN	确认软链
 
 ## 面板：静态快照 vs 本地服务
 
-面板有两种运行模式，二选一，中文优先、英文 ID 弱化展示为技术信息，左侧导航固定四块：总览、Skill 列表、场景包、软件接入，右上角有日间/夜间/跟随系统的主题切换（记在浏览器本地，刷新不丢）。
+面板有两种运行模式，二选一，中文优先、英文 ID 弱化展示为技术信息，左侧导航固定四块：总览、Skill 列表、场景包、软件接入，右上角有日间/夜间/跟随系统的主题切换、日间模式图标左边有中英文切换（都记在浏览器本地，刷新不丢）。中英切换只覆盖界面框架文字（按钮、标签、表头、提示），不含每个 Skill 自己的中文名称/简介、三个向导弹窗内部文字、toast/alert 提示——这几处保持中文，见 [ROADMAP](ROADMAP.md) 里"不做英文文档"那条的例外说明。
 
 ### 静态快照
 
@@ -244,6 +261,7 @@ skillctl dashboard serve
 - **本地拖拽导入**：把一个 Skill 文件夹或打包好的 `.zip` 直接拖进浏览器，收编进仓库。
 - **检查更新**：对所有用 `track-source`/`import-github` 登记过来源的 Skill，批量检查上游是否有新内容。
 - **+ 添加平台**：注册内置十个适配器之外的工具，补一行 `config/adapters/tools.tsv`。
+- **同步到云端**：顶部"GitHub 备份"卡片上的按钮，效果等同于 `skillctl backup sync --apply`，前提是已经跑过一次 `skillctl backup init --apply`；没配置过备份仓库时卡片会提示去终端跑 `backup init`，不提供面板内建仓库的入口（建仓库要求 `gh` 已登录，属于一次性设置，留在终端做）。
 
 不想用本地服务了，`Ctrl+C` 停掉进程即可；停掉之后双击面板文件看到的还是最后一次生成的静态快照，只是按钮点了不再生效。
 
@@ -283,9 +301,9 @@ skillctl dashboard serve
 ## 发布前检查清单（维护者自查）
 
 - [x] 仓库名（skill-warehouse）与命令名（skillctl）分离，两者独立检索均未发现直接冲突
-- [x] 全部脚本通过 `shellcheck`（v2 复查：新增的 `dashboard-server.py` 装机路径也过了 Python 语法检查）
+- [x] 全部脚本通过 `shellcheck`（v2 复查：新增的 `dashboard-server.py` 装机路径也过了 Python 语法检查；v3 复查：新代码过 `shellcheck` 时抓出一个真实 bug——`trash_path()` 被无意中定义了两份，同名后定义悄悄覆盖了 `import --replace` 本来在用的那份，已合并成一份共用实现，`work/run_skill_library_tests.sh` 18 套件 643 条断言全过）
 - [x] 干净账户（无既有 `~/.skill-library`）走通一遍上面的 Quickstart（v2 复查：含新增的 `dashboard-server.py` 是否被 `install-manager.sh` 正确装上）
-- [x] 文档描述的行为与代码实际行为逐条核对一致（v2 复查：`archive`/`restore` 已从代码里整体移除，README 不再提及；命令参考、面板章节按当前真实行为重写）
+- [x] 文档描述的行为与代码实际行为逐条核对一致（v2 复查：`archive`/`restore` 已从代码里整体移除，README 不再提及；命令参考、面板章节按当前真实行为重写。v3 复查：`deactivate` 段落原本写着"没有 CLI 级别的永久删除命令"，`delete` 命令加入后这句话已经是假的，已更新；场景式帮助的场景包示例原来写着 `core/aipm/frameflow/stock/lark`，但随包 `config/profiles/` 下只有 `core`，其余四个是维护者私人仓库的场景包名、不会存在于任何新装用户的环境里，已改成指向 `config/profiles/` 目录本身，不再列举不存在的名字）
 - [ ] 首次公开发布前，把 `LICENSE` 里的版权署名换成你希望使用的名义（默认写的是 "skill-warehouse contributors"）
 
 ## License

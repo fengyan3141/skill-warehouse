@@ -19,10 +19,15 @@ SAFETY MODEL — read before changing:
 - Bound to 127.0.0.1 only; every POST requires the per-session token; Host
   header must be 127.0.0.1/localhost (blocks DNS-rebinding from a malicious
   page open in another tab).
-- Only three actions are exposed: "activate", "deactivate" (both just shell
-  out to `skillctl <action> <id> --apply`, already idempotent/safe by
-  skillctl's own design), and "delete" (deactivate, then move the skill's
-  real folder in the repo to the system Trash — reversible, not `rm -rf`).
+- Only three actions are exposed: "activate", "deactivate", and "delete" —
+  all three just shell out to `skillctl <action> <id> --apply`, already
+  idempotent/safe by skillctl's own design. `skillctl delete` itself
+  deactivates, moves the skill's real folder to the system Trash (reversible,
+  not `rm -rf`), rebuilds catalog.tsv, and removes the id's row from
+  config/aliases.tsv — this used to be reimplemented here in Python (missing
+  the aliases.tsv cleanup, which then lingered forever); now there's one
+  implementation both this server and the static-mode copy-paste command
+  share.
 - /github-import (preview/confirm) shells out to `skillctl import-github`,
   which is the one place a raw external URL reaches this server. This code
   does NOT re-implement that command's URL/path validation — it stays the
@@ -48,6 +53,15 @@ SAFETY MODEL — read before changing:
   into {id, message} pairs for the dashboard to annotate rows with. No new
   write surface: check-updates itself never mutates anything, it only reads
   and, for stale-but-untouched skills, clones upstream to compare.
+- /backup shells out to `skillctl backup sync --apply` (no arguments reach it
+  from the request beyond the fixed literal "sync" action check — no id, no
+  url, no path, nothing string-interpolated into the subprocess argv). A
+  non-zero exit (e.g. a same-skill-directory merge conflict between local and
+  remote) is reported back as ok:false with skillctl's own printed guidance;
+  this endpoint never attempts to resolve a conflict itself, only surfaces
+  it. `skillctl backup init` (creating the private GitHub repo in the first
+  place) is deliberately NOT exposed here — it requires an authenticated
+  `gh` and is a one-time setup step, left to the terminal.
 - /add-custom-tool shells out to `skillctl tools add <name> <path> --apply`,
   which appends one row to config/adapters/tools.tsv. Validation (id-slug
   legality, id collisions, path must start with ~ or /) lives entirely in
@@ -65,14 +79,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SKILL_LIBRARY_ROOT = os.environ.get("SKILL_LIBRARY_ROOT") or os.path.expanduser("~/.skill-library")
 SKILLCTL = os.path.join(SKILL_LIBRARY_ROOT, "bin", "skillctl")
-BUILD_CATALOG = os.path.join(SKILL_LIBRARY_ROOT, "bin", "build-catalog.sh")
 DASHBOARD_HTML = os.path.join(SKILL_LIBRARY_ROOT, "dashboard", "index.html")
 SKILLS_DIR = os.path.join(SKILL_LIBRARY_ROOT, "skills")
 # 拖拽上传的这两个上限不是安全边界（本来就只挂在 127.0.0.1、要 token），
@@ -80,7 +92,6 @@ SKILLS_DIR = os.path.join(SKILL_LIBRARY_ROOT, "skills")
 # 这个量级基本可以确定是拖错了目录（比如整个项目、整个 Downloads）。
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_UPLOAD_FILES = 500
-HOME = os.path.realpath(os.path.expanduser("~"))
 TOKEN = secrets.token_urlsafe(24)
 ACTIONS = ("activate", "deactivate", "delete")
 
@@ -201,16 +212,6 @@ def find_skill_root(staging_dir):
     return None
 
 
-def move_to_trash(path):
-    script = 'tell application "Finder" to delete (POSIX file %s as alias)' % json.dumps(path)
-    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    if r.returncode != 0:
-        # 跟 storage-analyzer 的兜底策略一致：Finder 走不通（比如没给自动化
-        # 权限）就退回直接挪进 ~/.Trash。
-        dest = os.path.join(HOME, ".Trash", os.path.basename(path.rstrip("/")) + "." + time.strftime("%H%M%S"))
-        shutil.move(path, dest)
-
-
 def build_dashboard():
     r = subprocess.run([SKILLCTL, "dashboard", "build", "--apply"], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
@@ -261,6 +262,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_check_updates()
         elif self.path == "/add-custom-tool":
             self._handle_add_custom_tool()
+        elif self.path == "/backup":
+            self._handle_backup()
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -295,21 +298,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, json.dumps({"ok": False, "error": "id 不在仓库白名单：%s" % sid}))
             return
         try:
-            if action in ("activate", "deactivate"):
-                rc, out, err = run_skillctl(action, sid, "--apply")
-                if rc != 0:
-                    self._send(500, json.dumps({"ok": False, "error": (err or out).strip()}))
-                    return
-            else:  # delete
-                run_skillctl("deactivate", sid, "--apply")  # 已停用也无害跳过
-                path = os.path.join(SKILLS_DIR, sid)
-                if os.path.exists(path):
-                    move_to_trash(path)
-                # 仓库真身没了之后，catalog.tsv 里还留着这一行会被 doctor
-                # 报成"记录了 xxx 但目录不存在"——用仓库自带的重建脚本把
-                # catalog 同步一下，这一步失败不影响删除本身已经生效。
-                if os.path.isfile(BUILD_CATALOG):
-                    subprocess.run([BUILD_CATALOG, "--apply"], capture_output=True, text=True, timeout=30)
+            # 三个 action 现在都是单条 skillctl 命令，好处不只是省代码：删除
+            # 以前在这里单独实现（Trash 移动 + catalog 重建），漏了清理
+            # config/aliases.tsv 里那一行——skillctl delete 把这四步收进一
+            # 个命令后，这里跟静态模式复制的命令（build-dashboard.sh 里的
+            # commandForSelectedId）就是同一处实现，不会再各漏一遍。
+            rc, out, err = run_skillctl(action, sid, "--apply")
+            if rc != 0:
+                self._send(500, json.dumps({"ok": False, "error": (err or out).strip()}))
+                return
         except Exception as e:
             self._send(500, json.dumps({"ok": False, "error": str(e)}))
             return
@@ -483,6 +480,43 @@ class Handler(BaseHTTPRequestHandler):
             return
         output = (out or "") + (("\n" + err) if err else "")
         self._send(200, json.dumps({"ok": rc == 0, "output": output.strip()}, ensure_ascii=False))
+
+    def _handle_backup(self):
+        try:
+            req = self._read_json_body()
+        except Exception:
+            self._send(400, json.dumps({"ok": False, "error": "请求格式错误"}))
+            return
+        if not self._check_host_and_token(req):
+            return
+        if req.get("action") != "sync":
+            self._send(400, json.dumps({"ok": False, "error": "未知操作：%s" % req.get("action")}))
+            return
+        # 跟 check-updates 一样给足超时——git fetch/push 走网络，比本地文件
+        # 操作慢；rc != 0 最常见的原因是同一个 skill 目录本地和远端都改过，
+        # skillctl backup sync 自己已经把按目录分组的冲突说明和处理命令都
+        # 打印好了，这里原样透传给前端，不重新解释一遍。
+        # 每次请求都往 stdout 打一行结果——log_message 整个类都被静音了
+        # （见类顶注释），之前排查一次"点了同步、卡片却没变"的报告时发现
+        # 完全没有留痕可查，只能靠猜；这行不受那个静音影响（直接 print，
+        # 不走 log_message），跑 dashboard serve 的那个终端窗口就能看见。
+        try:
+            rc, out, err = run_skillctl("backup", "sync", "--apply", timeout=90)
+        except subprocess.TimeoutExpired:
+            print("[backup] 同步超时")
+            self._send(504, json.dumps({"ok": False, "error": "同步超时（可能是网络慢），可以重试"}))
+            return
+        except Exception as e:
+            print("[backup] 同步异常：%s" % e)
+            self._send(500, json.dumps({"ok": False, "error": str(e)}))
+            return
+        if rc != 0:
+            msg = (out or err or "同步失败").strip()
+            print("[backup] 同步失败（rc=%d）：%s" % (rc, msg.splitlines()[0] if msg else ""))
+            self._send(200, json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+            return
+        print("[backup] 同步成功")
+        self._send(200, json.dumps({"ok": True}))
 
 
 def main():

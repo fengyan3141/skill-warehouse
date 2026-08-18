@@ -664,6 +664,18 @@ write_alias_row() {
   atomic_replace "$tmp" "$aliases_file"
 }
 
+# 跟 write_alias_row 同一套 mktemp+过滤+atomic_replace 写法，反过来把这个
+# id 的行整条删掉（而不是清空某几列）——之前 delete 流程没调用这个（因为
+# 它压根不存在），导致 aliases.tsv 里的行永远不会因为 skill 被删除而消失，
+# 换机器 clone 下来会带着一堆指向不存在目录的死记录。
+remove_alias_row() {
+  local aliases_file="$1" id="$2" tmp
+  [ -f "$aliases_file" ] || return 0
+  tmp="$(mktemp "$(dirname "$aliases_file")/.aliases.tsv.XXXXXX")" || return 1
+  awk -F '\t' -v id="$id" '$0 ~ /^#/ || NF == 0 || $1 != id { print }' "$aliases_file" > "$tmp"
+  atomic_replace "$tmp" "$aliases_file"
+}
+
 collect_profiles_for_id() {
   local id="$1" file result=""
   for file in "$PROFILE_DIR"/*; do
@@ -687,12 +699,16 @@ LINT_FAIL=0
 # 用 Finder 的"移到废纸篓"语义删除一个路径：可反悔，不是 rm -rf。跟
 # dashboard-server.py 的 move_to_trash 是同一个策略（Finder 走不通就退回
 # 直接挪进 ~/.Trash），这里是 CLI 自己要用的 bash 版本——import --replace
-# 覆盖旧版本时靠这个，不再走仓库内部的 archive/ 备份那一套。
+# 覆盖旧版本、skillctl delete 都靠这一个共用实现，不再各写一份。
+# 路径先转义反斜杠和双引号再拼进 AppleScript 字符串——目前所有调用点传进
+# 来的都是仓库内已校验过的 slug 路径，不会真的踩到，但转义本身几乎零成本，
+# 不依赖"以后所有调用点都保证输入干净"这个假设。
 trash_path() {
-  local path="$1" dest
+  local path="$1" dest escaped
   [ -e "$path" ] || return 0
+  escaped="$(printf '%s' "$path" | sed 's/\\/\\\\/g; s/"/\\"/g')"
   if command -v osascript >/dev/null 2>&1 && \
-     osascript -e "tell application \"Finder\" to delete (POSIX file \"$path\" as alias)" >/dev/null 2>&1; then
+     osascript -e "tell application \"Finder\" to delete (POSIX file \"$escaped\" as alias)" >/dev/null 2>&1; then
     return 0
   fi
   dest="$HOME/.Trash/$(basename "$path").$(date +%H%M%S)"
@@ -2337,6 +2353,238 @@ cmd_lint() {
   [ "$LINT_FAIL" -eq 0 ]
 }
 
+# ---------------------------------------------------------------------------
+# backup —— 把仓库真身 push/pull 到一个私有 GitHub 仓库，供换机器时恢复。
+# 只管 SKILL_LIBRARY_ROOT 这一份数据仓库，跟 skillctl 工具本身（bin/lib，
+# 将来要开源的那份代码）完全独立——数据仓库必须私有，两者不能混进同一个仓库。
+# ---------------------------------------------------------------------------
+
+BACKUP_DEFAULT_REPO_NAME="skill-library-backup"
+
+backup_write_gitignore() {
+  cat > "$SKILL_LIBRARY_ROOT/.gitignore" <<'EOF'
+# skillctl backup 自动生成——机器本地产物，不进版本控制。
+.DS_Store
+**/.DS_Store
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/node_modules/
+eject-backups/
+# backup init 把 Skill 自带的内层 .git 重命名成 .git.bak（避免被当成断链
+# submodule）——这条规则保证它们不会被当成普通文件提交进备份，不能指望
+# 每个 Skill 自己的 .gitignore 里凑巧有条 *.bak 之类的规则罩住它。
+skills/*/.git.bak/
+# 面板整个目录都是构建产物，换机器后用 skillctl dashboard build --apply
+# 重新生成——不能只写 dashboard/index.html：生成过程会先 mktemp 一个
+# dashboard/.index.html.XXXXXX 再原子替换成最终文件，只忽略最终文件名的
+# 话，这个过程中的隐藏临时文件会被 git status 当成一项未提交的改动。
+dashboard/
+EOF
+}
+
+# 收编进仓库的 Skill 如果自带独立 .git（比如 import-github 时连着克隆下来
+# 的），git add 会把它当成断链的 submodule（gitlink），目录内容实际上不会
+# 被追踪进备份——必须先处理掉这些内层 .git。
+backup_find_nested_git_dirs() {
+  [ -d "$SKILL_LIBRARY_ROOT/skills" ] || return 0
+  find "$SKILL_LIBRARY_ROOT/skills" -mindepth 2 -maxdepth 2 -name '.git' -type d 2>/dev/null
+}
+
+cmd_backup_init() {
+  local apply="$1" remote_url="$2" repo_name="${3:-$BACKUP_DEFAULT_REPO_NAME}"
+
+  if [ -d "$SKILL_LIBRARY_ROOT/.git" ]; then
+    printf '%s 已经是 Git 仓库，无需再次 init；看现状用 skillctl backup status，提交同步用 skillctl backup sync\n' "$SKILL_LIBRARY_ROOT" >&2
+    return 1
+  fi
+
+  if [ -n "$remote_url" ]; then
+    if [ -d "$SKILL_LIBRARY_ROOT" ] && [ -n "$(ls -A "$SKILL_LIBRARY_ROOT" 2>/dev/null)" ]; then
+      printf '%s 已经有内容，为避免覆盖不会自动 clone 到这里。\n' "$SKILL_LIBRARY_ROOT" >&2
+      printf '确认要用远端备份覆盖本机的话，先手动挪走/清空这个目录，再重新运行这条命令。\n' >&2
+      return 1
+    fi
+    if [ "$apply" != "yes" ]; then
+      printf '[预演] 从备份恢复：\n'
+      printf '  git clone %s %s\n' "$remote_url" "$SKILL_LIBRARY_ROOT"
+      printf '\n确认后运行：skillctl backup init --remote %s --apply\n' "$remote_url"
+      return 0
+    fi
+    mkdir -p "$(dirname "$SKILL_LIBRARY_ROOT")"
+    git clone "$remote_url" "$SKILL_LIBRARY_ROOT"
+    printf '\n恢复完成，接下来：\n'
+    printf '  skillctl doctor                          —— 看哪些 Skill 还没在这台机器摊开\n'
+    printf '  skillctl profile use <场景包名> --apply   —— 或用 activate 逐个摊开\n'
+    printf '  skillctl tools connect <工具id> --apply   —— link 模式工具要额外建软链\n'
+    return 0
+  fi
+
+  local -a nested_git=()
+  while IFS= read -r nested_dir; do nested_git+=("$nested_dir"); done < <(backup_find_nested_git_dirs)
+
+  if [ "$apply" != "yes" ]; then
+    printf '[预演] skillctl backup init 将执行：\n'
+    printf '  1. git init（%s）\n' "$SKILL_LIBRARY_ROOT"
+    printf '  2. 写入 .gitignore（排除 .venv/__pycache__/node_modules/.DS_Store/dashboard 构建产物/eject 备份）\n'
+    if [ "${#nested_git[@]}" -gt 0 ]; then
+      printf '  3. 发现 %s 个 Skill 自带独立 .git，会重命名成 .git.bak（不删除，避免父仓库把它们当成断链 submodule、内容进不去备份）：\n' "${#nested_git[@]}"
+      local nested_dir
+      for nested_dir in "${nested_git[@]}"; do printf '     - %s\n' "${nested_dir%/.git}"; done
+    fi
+    printf '  4. git add -A && git commit -m "skillctl backup: 初始快照"\n'
+    printf '  5. gh repo create %s --private --source=. --remote=origin --push\n' "$repo_name"
+    printf '\n需要先 gh auth login 登录 GitHub；确认后运行：skillctl backup init --apply\n'
+    return 0
+  fi
+
+  command -v gh >/dev/null 2>&1 || { printf 'gh 命令不存在，先装 GitHub CLI 再试：https://cli.github.com/\n' >&2; return 1; }
+  gh auth status >/dev/null 2>&1 || { printf 'gh 还没登录，先运行：gh auth login\n' >&2; return 1; }
+
+  local nested_dir
+  for nested_dir in "${nested_git[@]}"; do
+    mv "$nested_dir" "${nested_dir}.bak"
+    printf '已重命名（保留历史，不进这个新仓库）：%s -> %s.bak\n' "$nested_dir" "$nested_dir"
+  done
+
+  backup_write_gitignore
+
+  (
+    cd "$SKILL_LIBRARY_ROOT"
+    git init -q
+    git add -A
+    git commit -q -m "skillctl backup: 初始快照"
+    gh repo create "$repo_name" --private --source=. --remote=origin --push
+  )
+  printf '\n备份仓库已创建并推送（私有）：%s\n往后改动用 skillctl backup sync [--apply] 提交同步。\n' "$repo_name"
+}
+
+cmd_backup_status() {
+  if [ ! -d "$SKILL_LIBRARY_ROOT/.git" ]; then
+    printf '%s 还不是 Git 仓库；运行 skillctl backup init 看设置步骤\n' "$SKILL_LIBRARY_ROOT"
+    return 0
+  fi
+  (
+    cd "$SKILL_LIBRARY_ROOT"
+    local branch remote dirty last ahead_behind ahead behind nested
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf '?')"
+    remote="$(git remote get-url origin 2>/dev/null || printf '（未设置）')"
+    printf '仓库：%s\n分支：%s\n远端：%s\n' "$SKILL_LIBRARY_ROOT" "$branch" "$remote"
+
+    dirty="$(git status --porcelain | wc -l | tr -d ' ')"
+    printf '未提交改动：%s 项\n' "$dirty"
+
+    if git remote get-url origin >/dev/null 2>&1; then
+      git fetch -q origin "$branch" 2>/dev/null || true
+      ahead_behind="$(git rev-list --left-right --count "origin/${branch}...${branch}" 2>/dev/null || printf '')"
+      if [ -n "$ahead_behind" ]; then
+        behind="$(printf '%s' "$ahead_behind" | awk '{print $1}')"
+        ahead="$(printf '%s' "$ahead_behind" | awk '{print $2}')"
+        printf '领先远端：%s 个提交　落后远端：%s 个提交\n' "$ahead" "$behind"
+      fi
+    fi
+
+    last="$(git log -1 --format='%ci' 2>/dev/null || printf '（还没有提交）')"
+    printf '最近一次提交：%s\n' "$last"
+
+    nested="$(backup_find_nested_git_dirs)"
+    [ -z "$nested" ] || printf '⚠️ 发现未处理的内嵌 .git（会被当成断链 submodule，内容进不去备份）：\n%s\n' "$nested"
+  )
+}
+
+cmd_backup_sync() {
+  local apply="$1"
+  [ -d "$SKILL_LIBRARY_ROOT/.git" ] || { printf '%s 还不是 Git 仓库，先运行 skillctl backup init\n' "$SKILL_LIBRARY_ROOT" >&2; return 1; }
+
+  (
+    cd "$SKILL_LIBRARY_ROOT"
+    local branch changed
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    git remote get-url origin >/dev/null 2>&1 || { printf '还没配置远端 origin，先运行 skillctl backup init\n' >&2; exit 1; }
+
+    if [ "$apply" != "yes" ]; then
+      printf '[预演] skillctl backup sync 将执行：\n'
+      changed="$(git status --porcelain)"
+      if [ -n "$changed" ]; then
+        printf '  1. 提交本地改动：\n'
+        printf '%s\n' "$changed" | sed 's/^/     /'
+      else
+        printf '  1. 本地无未提交改动\n'
+      fi
+      printf '  2. git fetch origin %s，远端有新提交就合并\n' "$branch"
+      printf '  3. 合并干净就 push；同一个 Skill 目录本地和远端都改过的话，会在这一步停下，按 Skill 整目录列出冲突，不自动帮你选\n'
+      printf '\n确认后运行：skillctl backup sync --apply\n'
+      exit 0
+    fi
+
+    git add -A
+    if ! git diff --cached --quiet; then
+      git commit -q -m "skillctl backup: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    fi
+
+    git fetch -q origin "$branch"
+
+    if git merge -q --no-edit "origin/$branch"; then
+      git push -q origin "$branch"
+      printf '同步完成，已推送到远端\n'
+    else
+      printf '⚠️ 远端和本地都改过同一批内容，自动合并停在这里，没有推送。冲突涉及：\n\n'
+      git diff --name-only --diff-filter=U | while IFS= read -r conflict_file; do
+        case "$conflict_file" in
+          skills/*/*) printf '%s\n' "${conflict_file#skills/}" | cut -d/ -f1 ;;
+          *) printf '%s\n' "$conflict_file" ;;
+        esac
+      done | LC_ALL=C sort -u | sed 's/^/  · /'
+      printf '\n按整个目录二选一处理（不是逐行改，在 %s 目录下执行）：\n' "$SKILL_LIBRARY_ROOT"
+      printf '  保留本机版本：git checkout --ours -- skills/<id> && git add skills/<id>\n'
+      printf '  保留远端版本：git checkout --theirs -- skills/<id> && git add skills/<id>\n'
+      printf '  两个都留：先把本机那份挪到 skills/<id>-local，再 git checkout --theirs -- skills/<id> && git add -A\n'
+      printf '\n处理完运行：git commit && skillctl backup sync --apply（补上 push）\n'
+      exit 1
+    fi
+  )
+}
+
+# 删除 = 停用（清共享货架软链）+ 仓库真身挪废纸篓（可反悔）+ catalog 重建
+# + aliases.tsv 里这行记录一起清掉。之前这四步分散在两处、还各自漏了最
+# 后一步：dashboard-server.py 的 /action delete 分支直接在 Python 里做前
+# 三步，静态模式复制的命令只有前两步（deactivate + osascript），两条路径
+# 都没人管 aliases.tsv。收成这一个命令后，两条路径都改成调用它，不再各
+# 写一遍、各漏一遍。
+cmd_delete() {
+  local id="$1" apply="$2"
+  local entry rel_path skill_dir
+
+  entry="$(catalog_entry "$id")"
+  if [ -z "$entry" ]; then
+    printf '仓库里没有这个 id：%s；不知道 id 就先 skillctl status 或 skillctl search <关键词>\n' "$id" >&2
+    return 1
+  fi
+  rel_path="${entry%%"$(printf '\t')"*}"
+  skill_dir="$SKILL_LIBRARY_ROOT/$rel_path"
+
+  if [ "$apply" != "yes" ]; then
+    printf '[预演] skillctl delete %s 将执行：\n' "$id"
+    printf '  1. 停用（清掉共享货架软链，未激活则无害跳过；link 模式工具自己的软链要另外 tools connect 才会刷新）\n'
+    printf '  2. 把 %s 挪进系统废纸篓（不是永久删除）\n' "$skill_dir"
+    printf '  3. 重建 catalog.tsv，清掉 config/aliases.tsv 里这个 id 的记录\n'
+    printf '\n确认后运行：skillctl delete %s --apply\n' "$id"
+    return 0
+  fi
+
+  deactivate_id "$GLOBAL_SKILLS_DIR" "$id" "yes"
+  manual_list_remove "$id"
+
+  if [ -e "$skill_dir" ]; then
+    trash_path "$skill_dir"
+  fi
+
+  rebuild_catalog_or_warn
+  remove_alias_row "$(resolve_aliases_file)" "$id"
+  auto_rebuild_dashboard
+  printf '已删除：%s（在系统废纸篓可恢复）\n' "$id"
+}
+
 # 改变了激活/连接状态的 --apply 命令收尾时调用，让本地面板不至于长期是
 # 陈旧快照。面板重建失败不应该让主命令本身报失败（激活/连接已经成功了），
 # 所以这里只警告、不改变调用方的退出码。
@@ -2364,7 +2612,7 @@ skillctl —— 多工具共用的 Skill 仓库管理
 
 常用场景：
   skillctl status —— 看现状：每个 Skill 的激活/冲突状态
-  skillctl profile use <场景包名> --apply —— 切场景包（core/aipm/frameflow/stock/lark）
+  skillctl profile use <场景包名> --apply —— 切场景包（core 永远保留，其余看 config/profiles/ 下有哪些）
   skillctl activate <id> --apply —— 激活一个 Skill
   skillctl deactivate <id> --apply —— 停用一个 Skill
   skillctl import <绝对目录> --apply —— 把仓库外的 Skill 收进仓库
@@ -2374,8 +2622,8 @@ skillctl —— 多工具共用的 Skill 仓库管理
   skillctl tools connect <工具id> --apply —— 把当前激活集合同步给某个工具
   skillctl doctor —— 体检：断链/工具检测/一致性等，只读
   skillctl lint —— 检查 Skill 内容质量：frontmatter/description 长度/触发词重叠，只读
-  skillctl dashboard build --apply && skillctl dashboard open —— 生成并打开本地只读面板
-  skillctl dashboard serve —— 起本地服务打开面板，激活/停用/删除按钮点击即生效（不用再复制命令到终端）
+  skillctl dashboard serve —— 起本地服务打开面板，按钮点击直接生效（激活/停用/删除/同步备份）
+  skillctl backup init/sync --apply —— 换机器备份：建私有 GitHub 仓库、提交推送改动，不带子命令看用法
   skillctl eject --apply —— 彻底退出这套软链管理（不可逆，先看预演）
 
 其他：skillctl list ・ search <关键词>
@@ -2397,6 +2645,7 @@ skillctl —— 多工具共用的 Skill 仓库管理
   skillctl status
   skillctl tools detect
   skillctl dashboard open
+  skillctl backup status
   skillctl doctor
   skillctl lint
   skillctl export <id> [--output <绝对路径>]        打包成干净拷贝，默认输出到 ~/Desktop/skill-export-<id>/
@@ -2414,6 +2663,9 @@ skillctl —— 多工具共用的 Skill 仓库管理
   skillctl tools disconnect <工具id> [--apply]
   skillctl dashboard build [--apply]
   skillctl dashboard serve         起本地服务，面板上的操作按钮直接生效
+  skillctl backup init [--remote <GitHub仓库地址>] [--repo-name 名称] [--apply]     不给 --remote 是全新建私仓；新机器恢复用 --remote
+  skillctl backup sync [--apply]        提交本地改动、拉取远端；冲突按 Skill 整目录列出，不逐行合并
+  skillctl delete <id> [--apply]        停用 + 挪进系统废纸篓 + 清理 catalog.tsv/config/aliases.tsv 记录
   skillctl eject [--apply]        彻底退出这套软链管理，不可逆
 
 实验性（行为不变，代码保留，不进常用场景速查）：
@@ -2528,7 +2780,7 @@ case "$command" in
     fi
     ;;
   profile)
-    [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || usage_error "用法：skillctl profile use <场景包名> [--apply]；场景包名如 core/aipm/frameflow/stock/lark"
+    [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || usage_error "用法：skillctl profile use <场景包名> [--apply]；场景包名看 config/profiles/ 目录下有哪些文件"
     [ "$1" = "use" ] || usage_error "用法：skillctl profile use <场景包名> [--apply]"
     profile_name="$2"
     apply="no"
@@ -2684,6 +2936,60 @@ case "$command" in
         cmd_dashboard_serve
         ;;
       *) usage_error "未知的 dashboard 子命令：${dashboard_sub}；支持 build/open/serve" ;;
+    esac
+    ;;
+  delete)
+    [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || usage_error "用法：skillctl delete <id> [--apply]；不知道 id 就先 skillctl status 或 skillctl search <关键词>"
+    id="$1"
+    apply="no"
+    if [ "$#" -eq 2 ]; then
+      [ "$2" = "--apply" ] || usage_error "未知参数：$2；delete 只接受结尾的 --apply"
+      apply="yes"
+    fi
+    require_catalog
+    cmd_delete "$id" "$apply"
+    ;;
+  backup)
+    [ "$#" -ge 1 ] || usage_error "用法：skillctl backup {init [--remote <GitHub仓库地址>] [--repo-name 名称] [--apply]|status|sync [--apply]}"
+    backup_sub="$1"
+    shift
+    case "$backup_sub" in
+      init)
+        remote_url=""
+        repo_name=""
+        apply="no"
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --remote)
+              [ "$#" -ge 2 ] || usage_error "--remote 后面需要跟 GitHub 仓库地址"
+              remote_url="$2"
+              shift 2
+              ;;
+            --repo-name)
+              [ "$#" -ge 2 ] || usage_error "--repo-name 后面需要跟仓库名"
+              repo_name="$2"
+              shift 2
+              ;;
+            --apply) apply="yes"; shift ;;
+            *) usage_error "未知参数：$1；backup init 支持 --remote/--repo-name/--apply" ;;
+          esac
+        done
+        cmd_backup_init "$apply" "$remote_url" "$repo_name"
+        ;;
+      status)
+        [ "$#" -eq 0 ] || usage_error "backup status 不接受参数"
+        cmd_backup_status
+        ;;
+      sync)
+        [ "$#" -eq 0 ] || [ "$#" -eq 1 ] || usage_error "用法：skillctl backup sync [--apply]"
+        apply="no"
+        if [ "$#" -eq 1 ]; then
+          [ "$1" = "--apply" ] || usage_error "未知参数：$1；backup sync 只接受结尾的 --apply"
+          apply="yes"
+        fi
+        cmd_backup_sync "$apply"
+        ;;
+      *) usage_error "未知的 backup 子命令：${backup_sub}；支持 init/status/sync" ;;
     esac
     ;;
   eject)
