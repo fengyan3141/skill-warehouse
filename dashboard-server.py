@@ -53,6 +53,16 @@ SAFETY MODEL — read before changing:
   into {id, message} pairs for the dashboard to annotate rows with. No new
   write surface: check-updates itself never mutates anything, it only reads
   and, for stale-but-untouched skills, clones upstream to compare.
+- /tools-action shells out to `skillctl tools <action> <id> --apply` (currently
+  only "connect" is exposed as a button; "disconnect" stays CLI-only for now,
+  matching how it's less commonly needed). The id here is a *tool* id
+  (e.g. "claude-code"), not a skill id, so it does NOT go through
+  skill_exists()/SKILLS_DIR — valid_tool_id() only checks the slug shape
+  (alnum + hyphen), same allowlist pattern as valid_skill_id(). Whether the id
+  is actually a registered adapter in config/adapters/tools.tsv is left to
+  `skillctl tools connect` itself to reject, same reuse principle as
+  /add-custom-tool: the real validation lives in skillctl (bash), not
+  duplicated here.
 - /backup shells out to `skillctl backup sync --apply` (no arguments reach it
   from the request beyond the fixed literal "sync" action check — no id, no
   url, no path, nothing string-interpolated into the subprocess argv). A
@@ -94,6 +104,7 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_UPLOAD_FILES = 500
 TOKEN = secrets.token_urlsafe(24)
 ACTIONS = ("activate", "deactivate", "delete")
+TOOL_ACTIONS = ("connect",)
 
 
 def valid_skill_id(sid):
@@ -104,6 +115,14 @@ def valid_skill_id(sid):
     if sid in (".", ".."):
         return False
     return all(c.isalnum() or c == "-" for c in sid)
+
+
+def valid_tool_id(tid):
+    # 工具 id 跟 skill id 是同一套 slug 规则，直接复用同一个判断——真正的
+    # "这个 id 是不是仓库里登记过的工具"这层校验，交给 skillctl tools
+    # connect 自己去做（它本来就会对着 config/adapters/tools.tsv 查，未登记
+    # 的 id 会报错退出），这里只挡明显不对的输入，不重复实现一遍规则。
+    return valid_skill_id(tid)
 
 
 def skill_exists(sid):
@@ -264,6 +283,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_add_custom_tool()
         elif self.path == "/backup":
             self._handle_backup()
+        elif self.path == "/tools-action":
+            self._handle_tools_action()
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -309,6 +330,32 @@ class Handler(BaseHTTPRequestHandler):
                 return
         except Exception as e:
             self._send(500, json.dumps({"ok": False, "error": str(e)}))
+            return
+        self._send(200, json.dumps({"ok": True}))
+
+    def _handle_tools_action(self):
+        try:
+            req = self._read_json_body()
+        except Exception:
+            self._send(400, json.dumps({"ok": False, "error": "请求格式错误"}))
+            return
+        if not self._check_host_and_token(req):
+            return
+        action = req.get("action")
+        tid = req.get("id")
+        if action not in TOOL_ACTIONS:
+            self._send(400, json.dumps({"ok": False, "error": "未知操作：%s" % action}))
+            return
+        if not valid_tool_id(tid):
+            self._send(400, json.dumps({"ok": False, "error": "工具 id 格式不对：%s" % tid}))
+            return
+        try:
+            rc, out, err = run_skillctl("tools", action, tid, "--apply", timeout=30)
+        except Exception as e:
+            self._send(500, json.dumps({"ok": False, "error": str(e)}))
+            return
+        if rc != 0:
+            self._send(200, json.dumps({"ok": False, "error": (err or out or "连接失败").strip()}, ensure_ascii=False))
             return
         self._send(200, json.dumps({"ok": True}))
 

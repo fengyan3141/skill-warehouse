@@ -311,8 +311,8 @@ render_adapters_section() {
     if [ "$mode" = "native" ]; then
       printf '<span class="empty-note" data-i18n="toolNativeHint">%s</span>' "$(html_escape "$command_text")"
     else
-      printf '<code class="technical-id">%s</code> <button type="button" class="copy-btn" data-i18n="copyBtn" onclick="copyCommand(this, %s)">复制</button>' \
-        "$(html_escape "$command_text")" "$(js_string_literal "$command_text")"
+      printf '<code class="technical-id">%s</code> <button type="button" class="copy-btn tools-connect-btn" data-i18n="copyBtn" onclick="runToolsConnect(this, %s, %s)">复制</button>' \
+        "$(html_escape "$command_text")" "$(js_string_literal "$id")" "$(js_string_literal "$command_text")"
     fi
     printf '</td></tr>\n'
   done < <(tr '\t' ';' < "$adapters_file")
@@ -910,6 +910,13 @@ if (LIVE) {
     bkBtn.disabled = false;
     bkBtn.title = '';
   }
+  // "软件接入"表格里每行的复制按钮，LIVE 模式下功能从"复制命令"变成"直接
+  // 帮你连接"——data-i18n 改成 btnConnect 这个 key，实际文字由脚本末尾统一
+  // 跑的 applyLanguage() 去填（同样是因为这里跑得比 I18N 字典赋值早，见
+  // liveSubtitle 那段注释里的解释，不重复）。
+  document.querySelectorAll('.tools-connect-btn').forEach(function (btn) {
+    btn.dataset.i18n = 'btnConnect';
+  });
 }
 function applyFilters() {
   var q = (document.getElementById('skill-search').value || '').toLowerCase();
@@ -1169,6 +1176,35 @@ function runBackupSync() {
     alert('同步到云端失败：\n\n' + String(e));
   });
 }
+// "软件接入"表格里每行那颗按钮：静态模式下还是原来的"复制命令到剪贴板"
+// （copyCommand 本来就不需要本地服务，兼容行为不变）；LIVE 模式下直接帮你
+// 跑 skillctl tools connect <id> --apply，不用再粘贴到终端——这是之前面板
+// 唯一一处"本地服务都起了、还是只给复制命令"的遗留，跟 activate/
+// deactivate/delete/backup sync 这些已经能直接执行的动作补齐成同一个体验。
+function runToolsConnect(btn, id, cmdText) {
+  if (!LIVE) { copyCommand(btn, cmdText); return; }
+  var originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = t('connecting');
+  fetch('/tools-action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: LIVE.token, id: id, action: 'connect' })
+  }).then(function (r) { return r.json(); }).then(function (data) {
+    if (data.ok) {
+      showActionToast('已连接，即将刷新页面…');
+      setTimeout(function () { location.reload(); }, 900);
+      return;
+    }
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    alert('连接失败：\n\n' + (data.error || '未知错误'));
+  }).catch(function (e) {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    alert('连接失败：\n\n' + String(e));
+  });
+}
 function showActionToast(message) {
   var toast = document.getElementById('action-toast');
   toast.textContent = message;
@@ -1268,7 +1304,9 @@ var I18N = {
   toolNotDetected: { zh: '未检测到', en: 'Not detected' },
   modeNative: { zh: '原生', en: 'Native' },
   modeLink: { zh: '软链', en: 'Symlink' },
-  toolNativeHint: { zh: '（原生模式，自动共享全局 Skill 目录，无需命令）', en: '(native mode — shares the global Skill directory automatically, no command needed)' }
+  toolNativeHint: { zh: '（原生模式，自动共享全局 Skill 目录，无需命令）', en: '(native mode — shares the global Skill directory automatically, no command needed)' },
+  btnConnect: { zh: '连接', en: 'Connect' },
+  connecting: { zh: '连接中…', en: 'Connecting…' }
 };
 function currentLang() {
   try { return localStorage.getItem('skill-dashboard-lang') === 'en' ? 'en' : 'zh'; } catch (e) { return 'zh'; }

@@ -37,6 +37,7 @@ ENTRYPOINTS=(
   "$PACKAGE/sync-skills.sh"
   "$PACKAGE/migrate-skills.sh"
   "$PACKAGE/install-manager.sh"
+  "$PACKAGE/install.command"
 )
 
 total_pass=0

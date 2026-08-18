@@ -23,7 +23,7 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 files=()
 while IFS= read -r f; do
   files+=("$f")
-done < <(find "$ROOT" -path "$ROOT/.git" -prune -o -type f \( -name '*.sh' -o -name 'skillctl' \) -print 2>/dev/null | sort)
+done < <(find "$ROOT" -path "$ROOT/.git" -prune -o -type f \( -name '*.sh' -o -name '*.command' -o -name 'skillctl' \) -print 2>/dev/null | sort)
 
 if [ "${#files[@]}" -eq 0 ]; then
   printf '中文标点扫描：未找到任何待扫描脚本，检查路径是否正确\n' >&2
