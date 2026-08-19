@@ -84,6 +84,7 @@ import base64
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -398,8 +399,14 @@ class Handler(BaseHTTPRequestHandler):
         url = req.get("url")
         # 真正的校验在 skillctl import-github 自己的正则里（唯一真源），这
         # 里只是个快速失败——不重复实现那套规则，只挡明显不对的输入。
-        if not isinstance(url, str) or not url.startswith("https://github.com/"):
-            self._send(400, json.dumps({"ok": False, "error": "url 必须是 https://github.com/ 开头"}))
+        # skillctl 自己认两种形状：完整的 https://github.com/... 链接，或者
+        # 不带协议头的 owner/repo 简写（它会在内部补全前缀）——这里的快速
+        # 失败也要认这两种，不然简写会在到达 skillctl 之前就先被这层拦掉。
+        _gh_shorthand_re = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+        if not isinstance(url, str) or not (
+            url.startswith("https://github.com/") or _gh_shorthand_re.match(url)
+        ):
+            self._send(400, json.dumps({"ok": False, "error": "url 必须是 https://github.com/ 开头，或者不带协议头的 owner/repo 简写"}))
             return
         path = req.get("path") or ""
         ref = req.get("ref") or ""
