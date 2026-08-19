@@ -1027,6 +1027,14 @@ cmd_import_github() {
   # 把多字节字符当一个整体处理，range 匹配会静默失效（实测过，不是保险
   # 起见）；这一步只删纯噪音，上面 sed 那一步已经把有意义的标点转换完了。
   url="$(printf '%s' "$url" | LC_ALL=C tr -d '\000-\037\177-\377')"
+  # 面板/命令行都常见直接填 "owner/repo" 这种从 GitHub 网页地址栏抠出来的
+  # 简写，不带协议头。只在整串就是"一个斜杠隔开两段合法字符、不带协议
+  # 头"这个精确形状时才补全——避免把用户本来就打错的东西（比如漏了协议
+  # 头的 tree 链接）悄悄误判成简写，补错了也不过是去 clone 一个不存在的
+  # owner/repo，下面的正则和报错逻辑照样能兜住。
+  if [[ "$url" != http://* && "$url" != https://* && "$url" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    url="https://github.com/$url"
+  fi
   local path_arg="" ref_arg=""
   local -a rest=()
   while [ "$#" -gt 0 ]; do
@@ -1064,7 +1072,7 @@ cmd_import_github() {
     tree_ref="${BASH_REMATCH[3]}"
     tree_path="${BASH_REMATCH[4]}"
   else
-    printf '只支持 https://github.com/<owner>/<repo> 或 https://github.com/<owner>/<repo>/tree/<ref>/<子路径> 这两种链接：%s\n' "$url" >&2
+    printf '只支持 https://github.com/<owner>/<repo>、https://github.com/<owner>/<repo>/tree/<ref>/<子路径>，或不带协议头的 <owner>/<repo> 简写：%s\n' "$url" >&2
     return 2
   fi
 

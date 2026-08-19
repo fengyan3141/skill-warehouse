@@ -1470,12 +1470,12 @@ function renderGithubWizard() {
   if (ghState.step === 1) {
     body.innerHTML =
       '<div class="gh-field"><label>GitHub 仓库 URL</label>' +
-      '<input type="text" id="gh-url" placeholder="https://github.com/owner/repo" value="' + ghEscape(ghState.url) + '"></div>' +
+      '<input type="text" id="gh-url" placeholder="https://github.com/owner/repo 或 owner/repo" value="' + ghEscape(ghState.url) + '"></div>' +
       '<div class="gh-field"><label>子路径（多 Skill 仓库才需要，比如 skills/brainstorming）</label>' +
       '<input type="text" id="gh-path" placeholder="可选" value="' + ghEscape(ghState.path) + '"></div>' +
       '<div class="gh-field"><label>分支 / tag</label>' +
       '<input type="text" id="gh-ref" placeholder="可选，默认仓库默认分支" value="' + ghEscape(ghState.ref) + '">' +
-      '<div class="gh-hint">粘贴浏览器地址栏里 .../tree/&lt;ref&gt;/&lt;子路径&gt; 这种链接会自动识别，不用手填后两项</div></div>' +
+      '<div class="gh-hint">粘贴浏览器地址栏里 .../tree/&lt;ref&gt;/&lt;子路径&gt; 这种链接会自动识别，不用手填后两项；不带协议头的 owner/repo 简写也认</div></div>' +
       '<div class="gh-actions"><button type="button" class="gh-btn gh-btn-secondary" onclick="closeGithubWizard()">取消</button>' +
       '<button type="button" class="gh-btn gh-btn-primary" id="gh-preview-btn" onclick="ghDoPreview()">预览导入</button></div>';
   } else if (ghState.step === 2) {
