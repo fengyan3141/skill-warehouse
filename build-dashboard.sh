@@ -1789,13 +1789,28 @@ function renderUploadWizard() {
       if (e.target.files.length) upHandleZipFile(e.target.files[0]);
     });
   } else if (upState.step === 2) {
-    body.innerHTML =
-      '<div class="gh-box' + (upState.previewOk ? ' ok' : ' fail') + '">' + ghEscape(upState.previewOutput) + '</div>' +
-      '<div class="gh-actions"><button type="button" class="gh-btn gh-btn-secondary" onclick="upState.step = 1; renderUploadWizard();">上一步</button>' +
-      (upState.previewOk
-        ? '<button type="button" class="gh-btn gh-btn-primary" onclick="upState.step = 3; renderUploadWizard();">下一步</button>'
-        : '<button type="button" class="gh-btn gh-btn-primary" onclick="upDoPreview()">重试</button>') +
-      '</div>';
+    // 仓库里已有同名 Skill 时，预览阶段的 dry-run 也会报冲突（跟是否勾了
+    // 替换无关），"替换"勾选框却在第 3 步——不特殊处理的话，失败框只有
+    // "重试"按钮，拿一模一样的参数再问一次，只会原样再失败一次，变成死
+    // 路。跟 GitHub 导入向导同款 conflictHint 处理保持一致：识别出这类
+    // "如需替换请使用"错误后，给一个跳到第 3 步的按钮，把"替换"勾好，
+    // 用户到那边还能反悔取消勾选。
+    var upConflictHint = (!upState.previewOk && upState.previewOutput.indexOf('如需替换请使用') !== -1);
+    if (upConflictHint) {
+      body.innerHTML =
+        '<div class="gh-box info">' + ghEscape(upState.previewOutput) + '</div>' +
+        '<div class="gh-hint" style="margin:10px 2px 6px;">仓库里已经有一份同名 Skill，内容跟拖进来的这份不一样，需要你确认是否替换。</div>' +
+        '<div class="gh-actions"><button type="button" class="gh-btn gh-btn-secondary" onclick="upState.step = 1; renderUploadWizard();">上一步</button>' +
+        '<button type="button" class="gh-btn gh-btn-primary" onclick="upState.replace = true; upState.step = 3; renderUploadWizard();">继续（可在下一步取消替换）</button></div>';
+    } else {
+      body.innerHTML =
+        '<div class="gh-box' + (upState.previewOk ? ' ok' : ' fail') + '">' + ghEscape(upState.previewOutput) + '</div>' +
+        '<div class="gh-actions"><button type="button" class="gh-btn gh-btn-secondary" onclick="upState.step = 1; renderUploadWizard();">上一步</button>' +
+        (upState.previewOk
+          ? '<button type="button" class="gh-btn gh-btn-primary" onclick="upState.step = 3; renderUploadWizard();">下一步</button>'
+          : '<button type="button" class="gh-btn gh-btn-primary" onclick="upDoPreview()">重试</button>') +
+        '</div>';
+    }
   } else if (upState.step === 3) {
     body.innerHTML =
       '<p class="gh-modal-subtitle" style="margin-bottom:12px;">确认导入：' + ghEscape(upState.pickedName) + '</p>' +
