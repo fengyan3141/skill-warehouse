@@ -107,6 +107,9 @@ MAX_UPLOAD_FILES = 500
 # 找到几十上百个 SKILL.md 基本可以确定是拖错了目录（比如整个仓库根目录），
 # 而不是真的要批量收编这么多 Skill。
 MAX_UPLOAD_SKILLS = 20
+# 面板"全部连接"一次性批量连接软链模式工具，tools.tsv 里已知加自定义注册
+# 的平台正常也就十几个，50 纯粹是防误传超长数组的兜底上限，不是预期用量。
+MAX_TOOL_IDS = 50
 TOKEN = secrets.token_urlsafe(24)
 ACTIONS = ("activate", "deactivate", "delete")
 TOOL_ACTIONS = ("connect",)
@@ -365,10 +368,42 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_host_and_token(req):
             return
         action = req.get("action")
-        tid = req.get("id")
         if action not in TOOL_ACTIONS:
             self._send(400, json.dumps({"ok": False, "error": "未知操作：%s" % action}))
             return
+
+        # "全部连接"传 ids（数组），逐个独立执行、不整体回滚——批量里某一个
+        # 工具连接失败（比如目录权限问题）不该连累其它已经能正常连接的一起
+        # 卡住，跟本地拖拽导入批量收编 Skill 是同一个设计取舍。单个 id 的
+        # 老路径原样保留，面板里每行的连接按钮继续用这条。
+        ids = req.get("ids")
+        if ids is not None:
+            if not isinstance(ids, list) or not ids:
+                self._send(400, json.dumps({"ok": False, "error": "ids 必须是非空数组"}))
+                return
+            if len(ids) > MAX_TOOL_IDS:
+                self._send(400, json.dumps({"ok": False, "error": "一次最多连接 %d 个工具" % MAX_TOOL_IDS}))
+                return
+            for one_id in ids:
+                if not valid_tool_id(one_id):
+                    self._send(400, json.dumps({"ok": False, "error": "工具 id 格式不对：%s" % one_id}, ensure_ascii=False))
+                    return
+            results = []
+            for one_id in ids:
+                try:
+                    rc, out, err = run_skillctl("tools", action, one_id, "--apply", timeout=30)
+                except Exception as e:
+                    results.append({"id": one_id, "ok": False, "error": str(e)})
+                    continue
+                if rc != 0:
+                    results.append({"id": one_id, "ok": False, "error": (err or out or "连接失败").strip()})
+                else:
+                    results.append({"id": one_id, "ok": True})
+            overall_ok = all(r["ok"] for r in results)
+            self._send(200, json.dumps({"ok": overall_ok, "results": results}, ensure_ascii=False))
+            return
+
+        tid = req.get("id")
         if not valid_tool_id(tid):
             self._send(400, json.dumps({"ok": False, "error": "工具 id 格式不对：%s" % tid}))
             return

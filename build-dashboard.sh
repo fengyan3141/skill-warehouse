@@ -311,8 +311,8 @@ render_adapters_section() {
     if [ "$mode" = "native" ]; then
       printf '<span class="empty-note" data-i18n="toolNativeHint">%s</span>' "$(html_escape "$command_text")"
     else
-      printf '<code class="technical-id">%s</code> <button type="button" class="copy-btn tools-connect-btn" data-i18n="copyBtn" onclick="runToolsConnect(this, %s, %s)">复制</button>' \
-        "$(html_escape "$command_text")" "$(js_string_literal "$id")" "$(js_string_literal "$command_text")"
+      printf '<code class="technical-id">%s</code> <button type="button" class="copy-btn tools-connect-btn" data-tool-id="%s" data-i18n="copyBtn" onclick="runToolsConnect(this, %s, %s)">复制</button>' \
+        "$(html_escape "$command_text")" "$(html_escape "$id")" "$(js_string_literal "$id")" "$(js_string_literal "$command_text")"
     fi
     printf '</td></tr>\n'
   done < <(tr '\t' ';' < "$adapters_file")
@@ -870,6 +870,7 @@ HTML_HEAD
 
   printf '<section id="adapters-section">\n'
   printf '<div class="section-header-row"><h2 data-i18n="sectionAdapters">软件接入</h2>'
+  printf '<button type="button" id="connect-all-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnConnectAll" onclick="runToolsConnectAll()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">全部连接</button>'
   printf '<button type="button" id="add-tool-btn" class="mode-toggle-btn btn-primary" data-i18n="btnAddTool" onclick="openAddToolWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">+ 添加平台</button></div>\n'
   render_adapters_section
   printf '</section>\n'
@@ -932,6 +933,19 @@ if (LIVE) {
   if (atBtn) {
     atBtn.disabled = false;
     atBtn.title = '';
+  }
+  // "全部连接"只在真的有软链模式的行需要连接时才可点——一个都没有的话
+  // （比如清一色 native 工具，或者已经全连上、只是这次没什么可做的），
+  // 点了也是白点，不如禁用并换一句说明，跟"需要本地服务"那条提示区分开。
+  var caBtn = document.getElementById('connect-all-btn');
+  if (caBtn) {
+    var connectableCount = document.querySelectorAll('.tools-connect-btn').length;
+    if (connectableCount > 0) {
+      caBtn.disabled = false;
+      caBtn.title = '';
+    } else {
+      caBtn.title = '没有需要连接的软链模式工具';
+    }
   }
   var bkBtn = document.getElementById('backup-sync-btn');
   if (bkBtn) {
@@ -1259,6 +1273,46 @@ function runToolsConnect(btn, id, cmdText) {
     alert('连接失败：\n\n' + String(e));
   });
 }
+// "全部连接"按钮：挨个点五六个工具的连接按钮太麻烦——之前每行按钮点完
+// 都会 location.reload()，没法简单地在一个循环里连续点它们（第一个成功
+// 就把页面刷掉了，后面的根本跑不到）。这里改成收集所有行的 tool id，
+// 一次性 POST 给 /tools-action（服务端 _handle_tools_action 支持批量的
+// ids 数组），中途不刷新，等全部跑完再统一提示、刷新一次。
+function runToolsConnectAll() {
+  if (!LIVE) return;
+  var ids = Array.prototype.map.call(document.querySelectorAll('.tools-connect-btn'), function (btn) {
+    return btn.dataset.toolId;
+  });
+  if (!ids.length) return;
+  var btn = document.getElementById('connect-all-btn');
+  var originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = t('connecting');
+  document.querySelectorAll('.tools-connect-btn').forEach(function (b) { b.disabled = true; });
+  fetch('/tools-action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: LIVE.token, ids: ids, action: 'connect' })
+  }).then(function (r) { return r.json(); }).then(function (data) {
+    var results = data.results || [];
+    var failed = results.filter(function (r) { return !r.ok; });
+    if (!failed.length) {
+      showActionToast('全部 ' + ids.length + ' 个已连接，即将刷新页面…');
+      setTimeout(function () { location.reload(); }, 900);
+      return;
+    }
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    document.querySelectorAll('.tools-connect-btn').forEach(function (b) { b.disabled = false; });
+    alert('部分连接失败（' + failed.length + ' / ' + ids.length + '）：\n\n' +
+      failed.map(function (r) { return r.id + '：' + (r.error || '未知错误'); }).join('\n'));
+  }).catch(function (e) {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    document.querySelectorAll('.tools-connect-btn').forEach(function (b) { b.disabled = false; });
+    alert('连接失败：\n\n' + String(e));
+  });
+}
 function showActionToast(message) {
   var toast = document.getElementById('action-toast');
   toast.textContent = message;
@@ -1342,6 +1396,7 @@ var I18N = {
   btnUploadImport: { zh: '本地拖拽导入', en: 'Drag & Drop Import' },
   btnCheckUpdates: { zh: '检查更新', en: 'Check Updates' },
   btnBackupSync: { zh: '同步到云端', en: 'Sync to Cloud' },
+  btnConnectAll: { zh: '全部连接', en: 'Connect All' },
   btnAddTool: { zh: '+ 添加平台', en: '+ Add Platform' },
   tooltipNeedsLive: { zh: '需要本地服务：skillctl dashboard serve', en: 'Requires local server: skillctl dashboard serve' },
   thStatus: { zh: '状态', en: 'Status' },
