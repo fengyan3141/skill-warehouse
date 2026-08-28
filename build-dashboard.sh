@@ -504,6 +504,12 @@ generate_dashboard() {
     margin: 0 0 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border);
   }
   .section-header-row h2 { margin: 0; padding-bottom: 0; border-bottom: none; }
+  /* section-header-row 本身是 justify-content: space-between 的两端对齐布局，
+     标题一个子元素、按钮多个子元素时，中间的按钮会被两端对齐规则单独摆在
+     标题和最后一个按钮之间、悬在半空——"全部连接"加进来之前只有一个按钮
+     没暴露这个问题。把多个按钮包进这个 flex 容器，让它们作为一个整体贴
+     在右侧、彼此紧挨着，容器本身才是 space-between 的第二个子元素。 */
+  .header-btn-group { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   .section-header-row .subtitle { margin: 4px 0 0; }
   h1 { font-size: 1.55rem; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.01em; }
   .subtitle { color: var(--text-muted); font-size: 0.86rem; margin: 0; }
@@ -870,8 +876,10 @@ HTML_HEAD
 
   printf '<section id="adapters-section">\n'
   printf '<div class="section-header-row"><h2 data-i18n="sectionAdapters">软件接入</h2>'
-  printf '<button type="button" id="connect-all-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnConnectAll" onclick="runToolsConnectAll()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">全部连接</button>'
-  printf '<button type="button" id="add-tool-btn" class="mode-toggle-btn btn-primary" data-i18n="btnAddTool" onclick="openAddToolWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">+ 添加平台</button></div>\n'
+  printf '<div class="header-btn-group">'
+  printf '<button type="button" id="connect-all-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnConnectAll" onclick="runToolsConnectAll()" disabled title="一次性把下面所有软链模式工具（CodeBuddy/TRAE/Qoder 等）连接到最新，不用逐行点；需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipConnectAllNeedsLive">全部连接</button>'
+  printf '<button type="button" id="add-tool-btn" class="mode-toggle-btn btn-primary" data-i18n="btnAddTool" onclick="openAddToolWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">+ 添加平台</button>'
+  printf '</div></div>\n'
   render_adapters_section
   printf '</section>\n'
 
@@ -936,28 +944,30 @@ if (LIVE) {
   }
   // "全部连接"只在真的有软链模式的行需要连接时才可点——一个都没有的话
   // （比如清一色 native 工具，或者已经全连上、只是这次没什么可做的），
-  // 点了也是白点，不如禁用并换一句说明，跟"需要本地服务"那条提示区分开。
+  // 点了也是白点，不如禁用。title 这里设不设都无所谓——脚本末尾统一跑的
+  // applyLanguage() 会按 data-i18n-title 把它覆盖成字典里的固定说明文字
+  // （下面 tooltipConnectAllNeedsLive 那条），跟其它几个"需要本地服务"
+  // 按钮同一套机制，不单独处理。
   var caBtn = document.getElementById('connect-all-btn');
   if (caBtn) {
     var connectableCount = document.querySelectorAll('.tools-connect-btn').length;
-    if (connectableCount > 0) {
-      caBtn.disabled = false;
-      caBtn.title = '';
-    } else {
-      caBtn.title = '没有需要连接的软链模式工具';
-    }
+    caBtn.disabled = connectableCount === 0;
   }
   var bkBtn = document.getElementById('backup-sync-btn');
   if (bkBtn) {
     bkBtn.disabled = false;
     bkBtn.title = '';
   }
-  // "软件接入"表格里每行的复制按钮，LIVE 模式下功能从"复制命令"变成"直接
-  // 帮你连接"——data-i18n 改成 btnConnect 这个 key，实际文字由脚本末尾统一
-  // 跑的 applyLanguage() 去填（同样是因为这里跑得比 I18N 字典赋值早，见
-  // liveSubtitle 那段注释里的解释，不重复）。
+  // "软件接入"表格里每行原来还有一个单独的"复制/连接"按钮，LIVE 模式下
+  // 功能是"直接帮你连这一个"——现在"全部连接"能一次性把所有行都连到最
+  // 新、且是幂等操作（已经连过的会跳过，不会重复添加或出错），逐行连接
+  // 在 LIVE 模式下已经没有存在的必要，藏起来减少一个功能重复的按钮；命
+  // 令本身还留着（<code> 那段文本），方便照着排查某一个工具单独出问题
+  // 的场景。静态快照模式下这个按钮的作用是"复制命令到剪贴板"，跟批量连
+  // 接不是一回事（静态页面没有后端可以真的执行批量操作），所以只在
+  // LIVE 模式下隐藏，静态模式保持原样不变。
   document.querySelectorAll('.tools-connect-btn').forEach(function (btn) {
-    btn.dataset.i18n = 'btnConnect';
+    btn.style.display = 'none';
   });
 }
 function applyFilters() {
@@ -1399,6 +1409,7 @@ var I18N = {
   btnConnectAll: { zh: '全部连接', en: 'Connect All' },
   btnAddTool: { zh: '+ 添加平台', en: '+ Add Platform' },
   tooltipNeedsLive: { zh: '需要本地服务：skillctl dashboard serve', en: 'Requires local server: skillctl dashboard serve' },
+  tooltipConnectAllNeedsLive: { zh: '一次性把下面所有软链模式工具（CodeBuddy/TRAE/Qoder 等）连接到最新，不用逐行点；需要本地服务：skillctl dashboard serve', en: 'Connect every link-mode tool (CodeBuddy/TRAE/Qoder, etc.) to the latest state in one go, no need to click each row; requires local server: skillctl dashboard serve' },
   thStatus: { zh: '状态', en: 'Status' },
   thName: { zh: '中文名称', en: 'Name' },
   thId: { zh: '英文 ID', en: 'ID' },
