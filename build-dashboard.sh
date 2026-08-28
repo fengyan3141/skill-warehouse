@@ -274,30 +274,27 @@ render_adapters_section() {
 
   detect_output="$("$SKILLCTL_BIN" tools detect 2>/dev/null || true)"
 
-  printf '<table><thead><tr><th data-i18n="thTool">软件</th><th data-i18n="thStatus">状态</th><th data-i18n="thToolMode">接入方式</th><th data-i18n="thToolCommand">安全命令</th></tr></thead><tbody>\n'
+  # 先把最终会渲染的行（已经套过内置工具"未检测到就隐藏"那条过滤规则）
+  # 收进数组，而不是读一行渲染一行——"全部连接"这颗按钮要用 rowspan 合
+  # 并进软链模式那几行、贴在它们旁边，需要提前知道"接下来连续几行都是
+  # 软链模式"，这在流式的单遍循环里做不到（读到当前行时看不到下一行），
+  # 数组两遍扫描换来的复杂度可以接受——这张表最多十来行，不是性能敏感的
+  # 地方。
+  local -a row_id=() row_display=() row_mode=() row_status=() row_command=()
   while IFS=';' read -r id display mode _global_dir _project_dir _cli_command _app_name verification; do
     [ -n "$id" ] || continue
     case "$id" in \#*) continue ;; esac
     status="$(printf '%s\n' "$detect_output" | awk -F '\t' -v id="$id" '$1 == id { print $2; exit }')"
     [ -n "$status" ] || status="未检测到"
     case "$BUILTIN_TOOL_IDS" in *" $id "*) is_builtin="yes" ;; *) is_builtin="no" ;; esac
-    # 内置列表里没装/没连的工具摆在这儿不能点、不能操作，纯属噪音，隐藏
-    # 掉（真要查这类信息去 skillctl doctor 看）；但用户自己用"添加平台"
-    # 注册的不受这条限制——刚注册完、目录还没建出来时本来就是"未检测
-    # 到"，这时候恰恰最需要看见它、拿到连接命令去把它接起来，藏起来才是
-    # 真的有问题。
     if [ "$is_builtin" = "yes" ]; then
       case "$status" in
         未检测到|可能是残留目录) continue ;;
       esac
     fi
     if [ "$mode" = "native" ]; then
-      mode_label="原生"
-      mode_label_key="modeNative"
       command_text="（原生模式，自动共享全局 Skill 目录，无需命令）"
     else
-      mode_label="软链"
-      mode_label_key="modeLink"
       # 这里的 ~ 是给用户看的字面文本（面板上一键复制的命令），不是要展开
       # 的路径，故意不用 $HOME 拼接。
       # shellcheck disable=SC2088
@@ -305,17 +302,59 @@ render_adapters_section() {
       [ "$verification" = "unverified" ] && command_text="$command_text --allow-unverified"
       command_text="$command_text --apply"
     fi
-    printf '<tr><td>%s <code class="technical-id">%s</code></td><td><span class="chip %s" data-i18n="%s">%s</span></td><td data-i18n="%s">%s</td><td>' \
+    row_id+=("$id"); row_display+=("$display"); row_mode+=("$mode")
+    row_status+=("$status"); row_command+=("$command_text")
+  done < <(tr '\t' ';' < "$adapters_file")
+
+  printf '<table><thead><tr><th data-i18n="thTool">软件</th><th data-i18n="thStatus">状态</th><th data-i18n="thToolMode">接入方式</th><th data-i18n="thToolCommand">安全命令</th><th class="connect-all-col"></th></tr></thead><tbody>\n'
+  local i n run_len j mode_label mode_label_key
+  n="${#row_id[@]}"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    id="${row_id[$i]}"; display="${row_display[$i]}"; mode="${row_mode[$i]}"
+    status="${row_status[$i]}"; command_text="${row_command[$i]}"
+    if [ "$mode" = "native" ]; then
+      mode_label="原生"; mode_label_key="modeNative"
+    else
+      mode_label="软链"; mode_label_key="modeLink"
+    fi
+    if [ "$mode" = "native" ]; then
+      printf '<tr>'
+    else
+      # "全部连接"按钮批量执行时要知道这一行对应哪个工具 id、以及静态
+      # 快照模式下降级为"复制全部命令"时要拼哪一句命令——都靠这两个
+      # data-* 属性从 DOM 里读出来，不用另外维护一份 JS 数组。
+      printf '<tr data-tool-id="%s" data-tool-command="%s">' "$(html_escape "$id")" "$(html_escape "$command_text")"
+    fi
+    printf '<td>%s <code class="technical-id">%s</code></td><td><span class="chip %s" data-i18n="%s">%s</span></td><td data-i18n="%s">%s</td><td>' \
       "$(html_escape "$display")" "$(html_escape "$id")" "$(adapter_status_class "$status")" "$(adapter_status_i18n_key "$status")" "$(html_escape "$status")" \
       "$mode_label_key" "$(html_escape "$mode_label")"
     if [ "$mode" = "native" ]; then
       printf '<span class="empty-note" data-i18n="toolNativeHint">%s</span>' "$(html_escape "$command_text")"
     else
-      printf '<code class="technical-id">%s</code> <button type="button" class="copy-btn tools-connect-btn" data-tool-id="%s" data-i18n="copyBtn" onclick="runToolsConnect(this, %s, %s)">复制</button>' \
-        "$(html_escape "$command_text")" "$(html_escape "$id")" "$(js_string_literal "$id")" "$(js_string_literal "$command_text")"
+      printf '<code class="technical-id">%s</code>' "$(html_escape "$command_text")"
     fi
-    printf '</td></tr>\n'
-  done < <(tr '\t' ';' < "$adapters_file")
+    printf '</td>'
+    # 这一行是"连续软链模式行"这个区块的第一行时，把"全部连接"按钮和小字
+    # 说明放进一个 rowspan 单元格，贴着这整块（原生模式行不需要连接，
+    # 这个格子留空但仍要占位，保证每行的列数一致，表格才不会错位）。
+    if [ "$mode" != "native" ] && { [ "$i" -eq 0 ] || [ "${row_mode[$((i-1))]}" = "native" ]; }; then
+      j="$i"
+      while [ "$j" -lt "$n" ] && [ "${row_mode[$j]}" != "native" ]; do j=$((j+1)); done
+      run_len=$((j - i))
+      printf '<td class="connect-all-col" rowspan="%d">' "$run_len"
+      # 不像 github-import-btn/upload-import-btn 那类纯 LIVE 功能，这颗
+      # 按钮静态快照模式下也有意义（退化成复制这几行的命令），所以不带
+      # disabled——两种模式都能点，只是点了之后干的事不一样。
+      printf '<button type="button" id="connect-all-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnConnectAll" onclick="runToolsConnectAll()" title="批量把这几个软链模式工具（CodeBuddy/TRAE/Qoder 等）连接到最新，不用逐行点；本地服务模式下直接生效，静态快照模式下复制这几行的命令" data-i18n-title="tooltipConnectAll">全部连接</button>'
+      printf '<p class="connect-all-caption" data-i18n="connectAllCaption">批量把左边这几个工具接到最新状态</p>'
+      printf '</td>'
+    elif [ "$mode" = "native" ]; then
+      printf '<td class="connect-all-col"></td>'
+    fi
+    printf '</tr>\n'
+    i=$((i+1))
+  done
   printf '</tbody></table>\n'
 }
 
@@ -504,13 +543,12 @@ generate_dashboard() {
     margin: 0 0 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border);
   }
   .section-header-row h2 { margin: 0; padding-bottom: 0; border-bottom: none; }
-  /* section-header-row 本身是 justify-content: space-between 的两端对齐布局，
-     标题一个子元素、按钮多个子元素时，中间的按钮会被两端对齐规则单独摆在
-     标题和最后一个按钮之间、悬在半空——"全部连接"加进来之前只有一个按钮
-     没暴露这个问题。把多个按钮包进这个 flex 容器，让它们作为一个整体贴
-     在右侧、彼此紧挨着，容器本身才是 space-between 的第二个子元素。 */
-  .header-btn-group { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   .section-header-row .subtitle { margin: 4px 0 0; }
+  /* "全部连接"从标题栏挪进表格本身之后（贴着它实际操作的那几行，而不是
+     悬在标题和"添加平台"中间的半空里），这一列专门用来放它——原生模式
+     的行不需要它，格子留空但仍然渲染，保证每行列数一致、表格线对得齐。 */
+  .connect-all-col { width: 148px; text-align: center; vertical-align: middle; }
+  .connect-all-caption { margin: 6px 0 0; font-size: 0.72rem; color: var(--text-muted); line-height: 1.4; }
   h1 { font-size: 1.55rem; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.01em; }
   .subtitle { color: var(--text-muted); font-size: 0.86rem; margin: 0; }
   .stat-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 24px; }
@@ -876,10 +914,7 @@ HTML_HEAD
 
   printf '<section id="adapters-section">\n'
   printf '<div class="section-header-row"><h2 data-i18n="sectionAdapters">软件接入</h2>'
-  printf '<div class="header-btn-group">'
-  printf '<button type="button" id="connect-all-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnConnectAll" onclick="runToolsConnectAll()" disabled title="一次性把下面所有软链模式工具（CodeBuddy/TRAE/Qoder 等）连接到最新，不用逐行点；需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipConnectAllNeedsLive">全部连接</button>'
-  printf '<button type="button" id="add-tool-btn" class="mode-toggle-btn btn-primary" data-i18n="btnAddTool" onclick="openAddToolWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">+ 添加平台</button>'
-  printf '</div></div>\n'
+  printf '<button type="button" id="add-tool-btn" class="mode-toggle-btn btn-primary" data-i18n="btnAddTool" onclick="openAddToolWizard()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">+ 添加平台</button></div>\n'
   render_adapters_section
   printf '</section>\n'
 
@@ -942,33 +977,18 @@ if (LIVE) {
     atBtn.disabled = false;
     atBtn.title = '';
   }
-  // "全部连接"只在真的有软链模式的行需要连接时才可点——一个都没有的话
-  // （比如清一色 native 工具，或者已经全连上、只是这次没什么可做的），
-  // 点了也是白点，不如禁用。title 这里设不设都无所谓——脚本末尾统一跑的
-  // applyLanguage() 会按 data-i18n-title 把它覆盖成字典里的固定说明文字
-  // （下面 tooltipConnectAllNeedsLive 那条），跟其它几个"需要本地服务"
-  // 按钮同一套机制，不单独处理。
-  var caBtn = document.getElementById('connect-all-btn');
-  if (caBtn) {
-    var connectableCount = document.querySelectorAll('.tools-connect-btn').length;
-    caBtn.disabled = connectableCount === 0;
-  }
   var bkBtn = document.getElementById('backup-sync-btn');
   if (bkBtn) {
     bkBtn.disabled = false;
     bkBtn.title = '';
   }
-  // "软件接入"表格里每行原来还有一个单独的"复制/连接"按钮，LIVE 模式下
-  // 功能是"直接帮你连这一个"——现在"全部连接"能一次性把所有行都连到最
-  // 新、且是幂等操作（已经连过的会跳过，不会重复添加或出错），逐行连接
-  // 在 LIVE 模式下已经没有存在的必要，藏起来减少一个功能重复的按钮；命
-  // 令本身还留着（<code> 那段文本），方便照着排查某一个工具单独出问题
-  // 的场景。静态快照模式下这个按钮的作用是"复制命令到剪贴板"，跟批量连
-  // 接不是一回事（静态页面没有后端可以真的执行批量操作），所以只在
-  // LIVE 模式下隐藏，静态模式保持原样不变。
-  document.querySelectorAll('.tools-connect-btn').forEach(function (btn) {
-    btn.style.display = 'none';
-  });
+}
+// "全部连接"在静态快照和本地服务两种模式下都有意义（分别是复制命令 /
+// 直接批量执行），所以这个禁用判断不放在上面 if (LIVE) 里——只有真的一
+// 个软链模式的行都没有时（比如清一色 native 工具）才禁用，点了也是白点。
+var connectAllBtn = document.getElementById('connect-all-btn');
+if (connectAllBtn) {
+  connectAllBtn.disabled = document.querySelectorAll('tr[data-tool-id]').length === 0;
 }
 function applyFilters() {
   var q = (document.getElementById('skill-search').value || '').toLowerCase();
@@ -1254,51 +1274,26 @@ function runBackupSync() {
     alert('同步到云端失败：\n\n' + String(e));
   });
 }
-// "软件接入"表格里每行那颗按钮：静态模式下还是原来的"复制命令到剪贴板"
-// （copyCommand 本来就不需要本地服务，兼容行为不变）；LIVE 模式下直接帮你
-// 跑 skillctl tools connect <id> --apply，不用再粘贴到终端——这是之前面板
-// 唯一一处"本地服务都起了、还是只给复制命令"的遗留，跟 activate/
-// deactivate/delete/backup sync 这些已经能直接执行的动作补齐成同一个体验。
-function runToolsConnect(btn, id, cmdText) {
-  if (!LIVE) { copyCommand(btn, cmdText); return; }
-  var originalLabel = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = t('connecting');
-  fetch('/tools-action', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token: LIVE.token, id: id, action: 'connect' })
-  }).then(function (r) { return r.json(); }).then(function (data) {
-    if (data.ok) {
-      showActionToast('已连接，即将刷新页面…');
-      setTimeout(function () { location.reload(); }, 900);
-      return;
-    }
-    btn.disabled = false;
-    btn.textContent = originalLabel;
-    alert('连接失败：\n\n' + (data.error || '未知错误'));
-  }).catch(function (e) {
-    btn.disabled = false;
-    btn.textContent = originalLabel;
-    alert('连接失败：\n\n' + String(e));
-  });
-}
-// "全部连接"按钮：挨个点五六个工具的连接按钮太麻烦——之前每行按钮点完
-// 都会 location.reload()，没法简单地在一个循环里连续点它们（第一个成功
-// 就把页面刷掉了，后面的根本跑不到）。这里改成收集所有行的 tool id，
-// 一次性 POST 给 /tools-action（服务端 _handle_tools_action 支持批量的
-// ids 数组），中途不刷新，等全部跑完再统一提示、刷新一次。
+// "全部连接"按钮贴在"软件接入"表格里软链模式那几行旁边（rowspan 合并
+// 的单元格，见 render_adapters_section）。LIVE 模式下一次性把这几个工具
+// 的 id POST 给 /tools-action（服务端支持批量 ids 数组，逐个独立执行，
+// 中途不刷新，等全部跑完再统一提示、刷新一次）；静态快照模式没有后端可
+// 以真的执行，退化成把这几行的命令逐条拼起来复制到剪贴板——跟其它按钮
+// "LIVE 直接生效、静态复制命令"的降级方式保持一致，不是这个按钮独有的
+// 例外。
 function runToolsConnectAll() {
-  if (!LIVE) return;
-  var ids = Array.prototype.map.call(document.querySelectorAll('.tools-connect-btn'), function (btn) {
-    return btn.dataset.toolId;
-  });
-  if (!ids.length) return;
+  var rows = document.querySelectorAll('tr[data-tool-id]');
   var btn = document.getElementById('connect-all-btn');
+  if (!rows.length || !btn) return;
+  if (!LIVE) {
+    var commands = Array.prototype.map.call(rows, function (tr) { return tr.dataset.toolCommand; });
+    copyCommand(btn, commands.join('\n'));
+    return;
+  }
+  var ids = Array.prototype.map.call(rows, function (tr) { return tr.dataset.toolId; });
   var originalLabel = btn.textContent;
   btn.disabled = true;
   btn.textContent = t('connecting');
-  document.querySelectorAll('.tools-connect-btn').forEach(function (b) { b.disabled = true; });
   fetch('/tools-action', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1313,13 +1308,11 @@ function runToolsConnectAll() {
     }
     btn.disabled = false;
     btn.textContent = originalLabel;
-    document.querySelectorAll('.tools-connect-btn').forEach(function (b) { b.disabled = false; });
     alert('部分连接失败（' + failed.length + ' / ' + ids.length + '）：\n\n' +
       failed.map(function (r) { return r.id + '：' + (r.error || '未知错误'); }).join('\n'));
   }).catch(function (e) {
     btn.disabled = false;
     btn.textContent = originalLabel;
-    document.querySelectorAll('.tools-connect-btn').forEach(function (b) { b.disabled = false; });
     alert('连接失败：\n\n' + String(e));
   });
 }
@@ -1407,9 +1400,10 @@ var I18N = {
   btnCheckUpdates: { zh: '检查更新', en: 'Check Updates' },
   btnBackupSync: { zh: '同步到云端', en: 'Sync to Cloud' },
   btnConnectAll: { zh: '全部连接', en: 'Connect All' },
+  connectAllCaption: { zh: '批量把左边这几个工具接到最新状态', en: 'Bring the tools on the left up to date in one go' },
   btnAddTool: { zh: '+ 添加平台', en: '+ Add Platform' },
   tooltipNeedsLive: { zh: '需要本地服务：skillctl dashboard serve', en: 'Requires local server: skillctl dashboard serve' },
-  tooltipConnectAllNeedsLive: { zh: '一次性把下面所有软链模式工具（CodeBuddy/TRAE/Qoder 等）连接到最新，不用逐行点；需要本地服务：skillctl dashboard serve', en: 'Connect every link-mode tool (CodeBuddy/TRAE/Qoder, etc.) to the latest state in one go, no need to click each row; requires local server: skillctl dashboard serve' },
+  tooltipConnectAll: { zh: '批量把这几个软链模式工具（CodeBuddy/TRAE/Qoder 等）连接到最新，不用逐行点；本地服务模式下直接生效，静态快照模式下复制这几行的命令', en: 'Connect every link-mode tool (CodeBuddy/TRAE/Qoder, etc.) to the latest state in one go, no need to click each row; applies instantly under the local server, copies the commands under the static snapshot' },
   thStatus: { zh: '状态', en: 'Status' },
   thName: { zh: '中文名称', en: 'Name' },
   thId: { zh: '英文 ID', en: 'ID' },
@@ -1428,7 +1422,6 @@ var I18N = {
   modeNative: { zh: '原生', en: 'Native' },
   modeLink: { zh: '软链', en: 'Symlink' },
   toolNativeHint: { zh: '（原生模式，自动共享全局 Skill 目录，无需命令）', en: '(native mode — shares the global Skill directory automatically, no command needed)' },
-  btnConnect: { zh: '连接', en: 'Connect' },
   connecting: { zh: '连接中…', en: 'Connecting…' }
 };
 function currentLang() {
