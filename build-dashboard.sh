@@ -347,7 +347,7 @@ render_adapters_section() {
       # 按钮静态快照模式下也有意义（退化成复制这几行的命令），所以不带
       # disabled——两种模式都能点，只是点了之后干的事不一样。
       printf '<button type="button" id="connect-all-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnConnectAll" onclick="runToolsConnectAll()" title="批量把这几个软链模式工具（CodeBuddy/TRAE/Qoder 等）连接到最新，不用逐行点；本地服务模式下直接生效，静态快照模式下复制这几行的命令" data-i18n-title="tooltipConnectAll">全部连接</button>'
-      printf '<p class="connect-all-caption" data-i18n="connectAllCaption">批量把左边这几个工具接到最新状态</p>'
+      printf '<p class="connect-all-caption" data-i18n="connectAllCaption">仓库里新激活的技能不会自动同步给它们，点这个批量补上，让它们也能用</p>'
       printf '</td>'
     elif [ "$mode" = "native" ]; then
       printf '<td class="connect-all-col"></td>'
@@ -547,7 +547,11 @@ generate_dashboard() {
   /* "全部连接"从标题栏挪进表格本身之后（贴着它实际操作的那几行，而不是
      悬在标题和"添加平台"中间的半空里），这一列专门用来放它——原生模式
      的行不需要它，格子留空但仍然渲染，保证每行列数一致、表格线对得齐。 */
-  .connect-all-col { width: 148px; text-align: center; vertical-align: middle; }
+  /* 左边界不能指望"前一个 td 的右边框"自动补上——rowspan 单元格只在它
+     所在的第一行的 DOM 里出现一次，后面被合并掉的那几行各自的最后一个
+     td 会被 `td:last-child { border-right: none; }` 命中，右边框直接没了。
+     这一列自己画左边框，不依赖相邻单元格的边框，跨行也不会断。 */
+  .connect-all-col { width: 148px; text-align: center; vertical-align: middle; border-left: 1px solid var(--border); }
   .connect-all-caption { margin: 6px 0 0; font-size: 0.72rem; color: var(--text-muted); line-height: 1.4; }
   h1 { font-size: 1.55rem; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.01em; }
   .subtitle { color: var(--text-muted); font-size: 0.86rem; margin: 0; }
@@ -1400,7 +1404,7 @@ var I18N = {
   btnCheckUpdates: { zh: '检查更新', en: 'Check Updates' },
   btnBackupSync: { zh: '同步到云端', en: 'Sync to Cloud' },
   btnConnectAll: { zh: '全部连接', en: 'Connect All' },
-  connectAllCaption: { zh: '批量把左边这几个工具接到最新状态', en: 'Bring the tools on the left up to date in one go' },
+  connectAllCaption: { zh: '仓库里新激活的技能不会自动同步给它们，点这个批量补上，让它们也能用', en: 'Newly activated skills don’t sync to these tools on their own — click to catch them all up so they can use them too' },
   btnAddTool: { zh: '+ 添加平台', en: '+ Add Platform' },
   tooltipNeedsLive: { zh: '需要本地服务：skillctl dashboard serve', en: 'Requires local server: skillctl dashboard serve' },
   tooltipConnectAll: { zh: '批量把这几个软链模式工具（CodeBuddy/TRAE/Qoder 等）连接到最新，不用逐行点；本地服务模式下直接生效，静态快照模式下复制这几行的命令', en: 'Connect every link-mode tool (CodeBuddy/TRAE/Qoder, etc.) to the latest state in one go, no need to click each row; applies instantly under the local server, copies the commands under the static snapshot' },
