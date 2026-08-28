@@ -2517,6 +2517,15 @@ cmd_backup_status() {
   )
 }
 
+# 只输出 git status --porcelain 原始行，不加任何装饰——给面板"未提交 N 项"
+# 那行提供点开看明细用的数据源，也可以直接在终端看哪些文件改了。跟
+# backup_sync 预演模式里打印的是同一个数据源，这里单独拆出一个子命令是因为
+# 预演模式那段输出混了别的说明文字，不适合被脚本解析。
+cmd_backup_files() {
+  [ -d "$SKILL_LIBRARY_ROOT/.git" ] || { printf '%s 还不是 Git 仓库；运行 skillctl backup init 看设置步骤\n' "$SKILL_LIBRARY_ROOT" >&2; return 1; }
+  (cd "$SKILL_LIBRARY_ROOT" && git status --porcelain)
+}
+
 cmd_backup_sync() {
   local apply="$1"
   [ -d "$SKILL_LIBRARY_ROOT/.git" ] || { printf '%s 还不是 Git 仓库，先运行 skillctl backup init\n' "$SKILL_LIBRARY_ROOT" >&2; return 1; }
@@ -2685,6 +2694,7 @@ skillctl —— 多工具共用的 Skill 仓库管理
   skillctl tools detect
   skillctl dashboard open
   skillctl backup status
+  skillctl backup files        逐行列出未提交改动的文件（git status --porcelain 原始格式）
   skillctl doctor
   skillctl lint
   skillctl export <id> [--output <绝对路径>]        打包成干净拷贝，默认输出到 ~/Desktop/skill-export-<id>/
@@ -3019,6 +3029,10 @@ case "$command" in
         [ "$#" -eq 0 ] || usage_error "backup status 不接受参数"
         cmd_backup_status
         ;;
+      files)
+        [ "$#" -eq 0 ] || usage_error "backup files 不接受参数"
+        cmd_backup_files
+        ;;
       sync)
         [ "$#" -eq 0 ] || [ "$#" -eq 1 ] || usage_error "用法：skillctl backup sync [--apply]"
         apply="no"
@@ -3028,7 +3042,7 @@ case "$command" in
         fi
         cmd_backup_sync "$apply"
         ;;
-      *) usage_error "未知的 backup 子命令：${backup_sub}；支持 init/status/sync" ;;
+      *) usage_error "未知的 backup 子命令：${backup_sub}；支持 init/status/files/sync" ;;
     esac
     ;;
   eject)

@@ -113,7 +113,7 @@ skillctl profile use core --apply
 
 ## 命令参考
 
-只读查询：`list` / `search <关键词>` / `status` / `tools detect` / `dashboard open` / `doctor` / `lint` / `check-updates [id]` / `export <id> [--output <绝对路径>]` / `backup status`
+只读查询：`list` / `search <关键词>` / `status` / `tools detect` / `dashboard open` / `doctor` / `lint` / `check-updates [id]` / `export <id> [--output <绝对路径>]` / `backup status` / `backup files`
 
 会改动状态（默认只预演，加 `--apply` 才真正执行）：`activate` / `deactivate` / `delete` / `profile use` / `import` / `import-github` / `track-source` / `tools connect` / `tools disconnect` / `dashboard build` / `eject` / `backup init` / `backup sync`
 
@@ -165,6 +165,7 @@ skillctl eject --apply
 skillctl backup init --apply                                        # 全新建一个私有 GitHub 仓库，把当前仓库推上去
 skillctl backup init --remote https://github.com/<你>/<仓库> --apply  # 换新机器：从已有备份克隆恢复
 skillctl backup status                                               # 只读：本地是否有未提交改动、跟远端差几个提交
+skillctl backup files                                                # 只读：逐行列出未提交改动的文件（git status --porcelain 原始格式）
 skillctl backup sync --apply                                         # 提交本地改动、拉取远端改动、推送
 ```
 
@@ -172,7 +173,7 @@ skillctl backup sync --apply                                         # 提交本
 
 `backup sync` 不是常驻自动同步，是手动触发的 push/pull。如果同一个 Skill 目录本地和远端都改过，合并会在这一步停下、按整个目录列出冲突（不是逐行 diff——Skill 内容大多是成段的 Markdown，逐行合并容易把两份不相关的改动拼出语义错误的结果），给出 `git checkout --ours/--theirs` 的具体处理命令，交给你手动二选一，不自动帮你决定该留哪边。
 
-`dashboard serve` 本地服务模式下，顶部统计卡片有一张"GitHub 备份"卡片，带一个同步按钮，效果等同于 `backup sync --apply`；静态快照模式下这颗按钮禁用，用终端命令代替。
+`dashboard serve` 本地服务模式下，顶部统计卡片有一张"GitHub 备份"卡片，带一个同步按钮，效果等同于 `backup sync --apply`；静态快照模式下这颗按钮禁用，用终端命令代替。有未提交改动时卡片上会出现"查看明细"，点开是 `backup files` 的原生 `<details>` 展开列表，逐个列出改了哪些文件（新增/修改/删除/改名），不用切到终端就能看清"未提交 N 项"具体是哪几项；这份列表是面板生成那一刻的快照，两种模式下都能点开看，不依赖本地服务。
 
 ## 低上下文路由（实验性）
 

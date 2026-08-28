@@ -110,8 +110,46 @@ render_backup_card() {
   printf '<span class="stat-label" data-i18n="statBackup">GitHub 备份</span>\n'
   printf '<p class="stat-hint" data-i18n-template="backupHint" data-dirty="%s" data-behind="%s">未提交 %s 项・落后云端 %s 个提交</p>\n' \
     "$(html_escape "$dirty")" "$(html_escape "$behind")" "$(html_escape "$dirty")" "$(html_escape "$behind")"
+  [ "$dirty" = "0" ] || render_backup_files_details
   printf '<button type="button" id="backup-sync-btn" class="mode-toggle-btn btn-ghost" data-i18n="btnBackupSync" onclick="runBackupSync()" disabled title="需要本地服务：skillctl dashboard serve" data-i18n-title="tooltipNeedsLive">同步到云端</button>\n'
   printf '</div>\n</div>\n'
+}
+
+# "未提交 N 项"具体是哪几个文件，用原生 <details>/<summary> 展开——静态
+# 快照模式下这份列表是 build 那一刻的快照（跟卡片上的数字同一次
+# skillctl backup files 调用出来的，天然一致），不需要额外的 JS 或者服务端
+# 接口就能点开看，跟"同步到云端"按钮那种必须依赖本地服务的操作不是一回事。
+render_backup_files_details() {
+  local files_output line xy path chip_class chip_label
+  files_output="$("$SKILLCTL_BIN" backup files 2>/dev/null)"
+  [ -n "$files_output" ] || return 0
+
+  # chip 标签是每一行自己的状态数据，跟表格里 chip-active/chip-warehouse
+  # 那两个逐行状态徽标同一个约定——不套 data-i18n，保持中文（见上面中英
+  # 切换范围的说明：表格行内容属于数据不是文案）。<summary> 才是框架文案，
+  # 单独套 data-i18n。
+  printf '<details class="stat-backup-details">\n<summary data-i18n="backupDetailsSummary">查看明细</summary>\n<ul class="stat-backup-files">\n'
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    xy="${line:0:2}"
+    path="${line:3}"
+    # 重命名格式是 "R  old -> new"，只展示新路径，跟表格其它地方展示当前
+    # 路径的习惯一致，旧路径不是用户需要马上看到的信息。
+    path="${path##* -> }"
+    case "$xy" in
+      \?\?) chip_class="chip-file-add"; chip_label="未跟踪" ;;
+      A*|*A) chip_class="chip-file-add"; chip_label="新增" ;;
+      D*|*D) chip_class="chip-file-delete"; chip_label="删除" ;;
+      R*|*R) chip_class="chip-file-modify"; chip_label="改名" ;;
+      *) chip_class="chip-file-modify"; chip_label="修改" ;;
+    esac
+    # 路径较长时（比如嵌套 skill 目录）交给浏览器默认的整词换行会在字符
+    # 中间硬切，很难认；在每个 "/" 后面插一个 <wbr>，只在目录分隔处才允许
+    # 换行，跟文件路径本身的可读性保持一致。
+    printf '<li><span class="chip %s">%s</span><span class="file-path">%s</span></li>\n' \
+      "$chip_class" "$chip_label" "$(html_escape "$path" | sed 's#/#/<wbr>#g')"
+  done <<< "$files_output"
+  printf '</ul>\n</details>\n'
 }
 
 render_skills_table() {
@@ -628,6 +666,25 @@ generate_dashboard() {
   .chip-archived { background: var(--warning-bg); color: var(--warning); }
   .chip-missing { background: var(--danger-bg); color: var(--danger); }
   .chip-conflict { background: var(--danger-bg); color: var(--danger); }
+  .chip-file-add { background: var(--success-bg); color: var(--success); }
+  .chip-file-modify { background: var(--warning-bg); color: var(--warning); }
+  .chip-file-delete { background: var(--danger-bg); color: var(--danger); }
+  .stat-backup-details { margin: 2px 0 6px; }
+  .stat-backup-details summary {
+    font-size: 0.72rem; color: var(--primary); cursor: pointer; list-style: none; user-select: none;
+  }
+  .stat-backup-details summary::-webkit-details-marker { display: none; }
+  .stat-backup-details summary::before { content: "▸ "; }
+  .stat-backup-details[open] summary::before { content: "▾ "; }
+  .stat-backup-files {
+    list-style: none; margin: 6px 0 0; padding: 0; max-height: 160px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .stat-backup-files li { display: flex; align-items: baseline; gap: 6px; }
+  .stat-backup-files .chip { flex-shrink: 0; }
+  .stat-backup-files .file-path {
+    font-size: 0.72rem; color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
   .empty-note { color: var(--text-muted); font-size: 0.85rem; }
   button { font-family: inherit; }
   button.copy-btn {
@@ -1380,6 +1437,7 @@ var I18N = {
   backupOffHintPre: { zh: '终端运行 ', en: 'Run ' },
   backupOffHintPost: { zh: ' 开启', en: ' in a terminal to set up' },
   backupHint: { zh: '未提交 {dirty} 项・落后云端 {behind} 个提交', en: '{dirty} uncommitted · {behind} behind cloud' },
+  backupDetailsSummary: { zh: '查看明细', en: 'View details' },
   sectionSkills: { zh: 'Skill 列表', en: 'Skills' },
   sectionProfiles: { zh: '场景包', en: 'Profiles' },
   sectionAdapters: { zh: '软件接入', en: 'Tools' },
